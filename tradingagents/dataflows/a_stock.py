@@ -2144,3 +2144,336 @@ def get_industry_comparison(
         lines.append(f"行业对比查询失败: {e}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 18. Chip Distribution (筹码分布 - Python CYQ algorithm)
+# ---------------------------------------------------------------------------
+
+_CYQ_PRICE_BUCKETS = 150
+_CYQ_KLINE_COUNT = 210
+
+
+def _em_fetch_klines(code: str, count: int = _CYQ_KLINE_COUNT) -> list[dict]:
+    """Fetch daily K-lines from Eastmoney push2his for CYQ calculation.
+
+    Returns list of dicts with keys: date, open, close, high, low, volume, amount, turnover.
+    """
+    market = "1" if code.startswith(("6", "9")) else "0"
+    secid = f"{market}.{code}"
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "0",
+        "end": "20500101",
+        "lmt": str(count),
+    }
+    r = _em_get(url, params=params, timeout=15)
+    d = r.json()
+    klines = d.get("data", {}).get("klines", [])
+    records = []
+    for k in klines:
+        parts = k.split(",")
+        if len(parts) >= 11:
+            try:
+                records.append({
+                    "date": parts[0],
+                    "open": float(parts[1]),
+                    "close": float(parts[2]),
+                    "high": float(parts[3]),
+                    "low": float(parts[4]),
+                    "volume": float(parts[5]),
+                    "amount": float(parts[6]),
+                    "amplitude": float(parts[7]),
+                    "pct_chg": float(parts[8]),
+                    "turnover": float(parts[10]),
+                })
+            except (ValueError, IndexError):
+                continue
+    return records
+
+
+def _compute_cyq(klines: list[dict]) -> dict:
+    """Compute chip distribution (CYQ) from K-line data.
+
+    Algorithm:
+    1. Determine price range from all K-lines (min low ~ max high)
+    2. Create 150 price buckets
+    3. For each day, decay existing chips by (1 - turnover/100)
+    4. Distribute today's volume as a triangle between low~high, peak at close
+    5. After processing all days, compute profit ratio, avg cost, concentration
+
+    Returns dict with: profit_ratio, avg_cost, cost_90_low, cost_90_high,
+                       concentration_90, cost_70_low, cost_70_high, concentration_70
+    """
+    if len(klines) < 10:
+        return {}
+
+    prices_low = [k["low"] for k in klines]
+    prices_high = [k["high"] for k in klines]
+    p_min = min(prices_low)
+    p_max = max(prices_high)
+    if p_max <= p_min:
+        return {}
+
+    bucket_size = (p_max - p_min) / _CYQ_PRICE_BUCKETS
+    if bucket_size <= 0:
+        return {}
+
+    # chip[b] = volume of chips at price bucket b
+    chip = [0.0] * _CYQ_PRICE_BUCKETS
+
+    for k in klines:
+        # Decay existing chips by turnover rate
+        turnover = k.get("turnover", 0)
+        decay = max(0.0, 1.0 - turnover / 100.0)
+        for b in range(_CYQ_PRICE_BUCKETS):
+            chip[b] *= decay
+
+        # Distribute today's volume as triangle: low~close~high
+        vol = k.get("volume", 0)
+        if vol <= 0:
+            continue
+
+        lo = k["low"]
+        hi = k["high"]
+        cl = k["close"]
+        if hi <= lo:
+            b_idx = int((cl - p_min) / bucket_size)
+            if 0 <= b_idx < _CYQ_PRICE_BUCKETS:
+                chip[b_idx] += vol
+            continue
+
+        # Triangle distribution: peak at close, linear to low and high
+        for b in range(_CYQ_PRICE_BUCKETS):
+            bucket_price = p_min + (b + 0.5) * bucket_size
+            if bucket_price < lo or bucket_price > hi:
+                continue
+            if bucket_price <= cl:
+                if cl > lo:
+                    weight = (bucket_price - lo) / (cl - lo)
+                else:
+                    weight = 1.0
+            else:
+                if hi > cl:
+                    weight = (hi - bucket_price) / (hi - cl)
+                else:
+                    weight = 1.0
+            chip[b] += vol * weight
+
+    # Normalize chip distribution
+    total_chip = sum(chip)
+    if total_chip <= 0:
+        return {}
+
+    # Profit ratio: chips below current price
+    current_price = klines[-1]["close"]
+    profit_ratio = 0.0
+    for b in range(_CYQ_PRICE_BUCKETS):
+        bucket_price = p_min + (b + 0.5) * bucket_size
+        if bucket_price <= current_price:
+            profit_ratio += chip[b]
+    profit_ratio /= total_chip
+
+    # Average cost
+    avg_cost = 0.0
+    for b in range(_CYQ_PRICE_BUCKETS):
+        bucket_price = p_min + (b + 0.5) * bucket_size
+        avg_cost += bucket_price * chip[b]
+    avg_cost /= total_chip
+
+    # Find percentile prices
+    def _percentile_price(pct):
+        target = pct * total_chip
+        cum = 0.0
+        for b in range(_CYQ_PRICE_BUCKETS):
+            cum += chip[b]
+            if cum >= target:
+                return p_min + (b + 0.5) * bucket_size
+        return p_max
+
+    cost_90_low = _percentile_price(0.05)
+    cost_90_high = _percentile_price(0.95)
+    cost_70_low = _percentile_price(0.15)
+    cost_70_high = _percentile_price(0.85)
+
+    concentration_90 = (cost_90_high - cost_90_low) / (cost_90_high + cost_90_low) if (cost_90_high + cost_90_low) > 0 else 0
+    concentration_70 = (cost_70_high - cost_70_low) / (cost_70_high + cost_70_low) if (cost_70_high + cost_70_low) > 0 else 0
+
+    return {
+        "profit_ratio": round(profit_ratio, 4),
+        "avg_cost": round(avg_cost, 4),
+        "cost_90_low": round(cost_90_low, 4),
+        "cost_90_high": round(cost_90_high, 4),
+        "concentration_90": round(concentration_90, 4),
+        "cost_70_low": round(cost_70_low, 4),
+        "cost_70_high": round(cost_70_high, 4),
+        "concentration_70": round(concentration_70, 4),
+        "current_price": round(current_price, 4),
+    }
+
+
+def get_astock_chip_distribution(
+    ticker: str,
+) -> str:
+    """Get chip distribution (筹码分布) for an A-stock.
+
+    Computes profit ratio, average cost, 90%/70% concentration zones
+    using a Python CYQ algorithm on 210 daily K-lines.
+
+    Args:
+        ticker: 6-digit A-share code
+    Returns:
+        Formatted text with chip distribution analysis
+    """
+    code = safe_ticker_component(ticker)
+    lines = [f"# 筹码分布 | {code}"]
+
+    try:
+        klines = _em_fetch_klines(code)
+        if len(klines) < 10:
+            return f"[筹码分布] {code}: K线数据不足({len(klines)}根)"
+
+        cyq = _compute_cyq(klines)
+        if not cyq:
+            return f"[筹码分布] {code}: 筹码计算失败"
+
+        current_price = cyq["current_price"]
+        profit_ratio = cyq["profit_ratio"]
+        avg_cost = cyq["avg_cost"]
+        c90 = cyq["concentration_90"]
+        c70 = cyq["concentration_70"]
+
+        lines.append(f"# 数据源: 东财K线({len(klines)}根) + Python CYQ算法")
+        lines.append("")
+
+        # Chip health assessment
+        if profit_ratio >= 0.9:
+            health = "警惕（获利盘极高，抛压风险大）"
+        elif c90 < 0.15 and 0.3 <= profit_ratio < 0.9:
+            health = "健康（筹码集中且获利比例适中）"
+        elif c90 >= 0.25:
+            health = "警惕（筹码分散，主力控盘弱）"
+        else:
+            health = "一般"
+
+        lines.append(f"当前价: {current_price}")
+        lines.append(f"获利比例: {profit_ratio:.1%}")
+        lines.append(f"平均成本: {avg_cost}")
+        lines.append(f"90%成本区间: {cyq['cost_90_low']} ~ {cyq['cost_90_high']}")
+        lines.append(f"90%集中度: {c90:.2%} {'(集中)' if c90 < 0.15 else '(分散)' if c90 > 0.25 else '(适中)'}")
+        lines.append(f"70%成本区间: {cyq['cost_70_low']} ~ {cyq['cost_70_high']}")
+        lines.append(f"70%集中度: {c70:.2%}")
+        lines.append(f"筹码健康度: {health}")
+        lines.append("")
+
+        # Position relative to cost
+        if current_price > avg_cost * 1.1:
+            lines.append(f"当前价高于平均成本 {(current_price/avg_cost-1)*100:.1f}%，获利盘较多")
+        elif current_price < avg_cost * 0.9:
+            lines.append(f"当前价低于平均成本 {(1-current_price/avg_cost)*100:.1f}%，套牢盘较多")
+        else:
+            lines.append("当前价接近平均成本，筹码在成本附近")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[筹码分布] {code}: 获取异常: {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# 19. Limit Up Pool / Consecutive Boards (涨停池/连板梯队)
+# ---------------------------------------------------------------------------
+
+def get_astock_limit_up_pool(
+    curr_date: str = "",
+    n: int = 20,
+) -> str:
+    """Get limit-up pool with consecutive board ladder (涨停池/连板梯队).
+
+    Direct HTTP to Eastmoney push2ex getTopicZTPool.
+
+    Args:
+        curr_date: YYYY-MM-DD format, empty for today
+        n: number of top stocks to return (sorted by consecutive boards desc)
+    Returns:
+        Formatted text with limit-up pool and board ladder analysis
+    """
+    if not curr_date:
+        curr_date = datetime.now().strftime("%Y-%m-%d")
+    date_compact = curr_date.replace("-", "")
+
+    lines = [f"# 涨停池/连板梯队 | {curr_date}"]
+
+    try:
+        url = "https://push2ex.eastmoney.com/getTopicZTPool"
+        params = {
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "dpt": "wz.ztzt",
+            "Pageindex": "0",
+            "pagesize": "10000",
+            "sort": "fbt:asc",
+            "date": date_compact,
+        }
+        r = _em_get(url, params=params, timeout=15)
+        d = r.json()
+        pool = d.get("data", {}).get("pool", [])
+
+        if not pool:
+            lines.append("当日无涨停股或数据未更新")
+            return "\n".join(lines)
+
+        # Parse and sort by consecutive boards desc, first limit time asc
+        stocks = []
+        for item in pool:
+            stocks.append({
+                "code": item.get("code", ""),
+                "name": item.get("name", ""),
+                "price": round(item.get("price", 0) / 1000, 2),
+                "change_pct": item.get("zdp", 0),
+                "amount": item.get("amount", 0),
+                "turnover": item.get("hs", 0),
+                "consecutive_boards": item.get("lbc", 0),
+                "first_limit_time": str(item.get("fbt", "")).zfill(6),
+                "last_limit_time": str(item.get("lbt", "")).zfill(6),
+                "seal_amount": item.get("fund", 0),
+                "break_count": item.get("zbc", 0),
+                "industry": item.get("hy", ""),
+            })
+
+        stocks.sort(key=lambda x: (-x["consecutive_boards"], x["first_limit_time"]))
+        top = stocks[:n]
+
+        lines.append(f"# 数据源: 东财push2ex | 共 {len(pool)} 只涨停")
+        lines.append("")
+
+        # Board ladder summary
+        board_counts = {}
+        for s in stocks:
+            bc = s["consecutive_boards"]
+            board_counts[bc] = board_counts.get(bc, 0) + 1
+        ladder_parts = []
+        for bc in sorted(board_counts.keys(), reverse=True):
+            suffix = "板" if bc == 1 else "连板"
+            ladder_parts.append(f"{bc}{suffix}({board_counts[bc]}只)")
+        lines.append(f"连板梯队: {' > '.join(ladder_parts)}")
+        lines.append("")
+
+        # Top stocks table
+        lines.append(f"{'代码':<8} {'名称':<8} {'连板':>4} {'涨幅':>8} {'现价':>8} {'封板资金':>12} {'炸板':>4} {'行业':<8} {'首封时间':<8}")
+        lines.append("-" * 80)
+        for s in top:
+            seal_str = f"{s['seal_amount']/1e8:.2f}亿" if s["seal_amount"] > 0 else "N/A"
+            fbt = s["first_limit_time"]
+            fbt_str = f"{fbt[:2]}:{fbt[2:4]}:{fbt[4:]}" if len(fbt) >= 6 else fbt
+            lines.append(
+                f"{s['code']:<8} {s['name']:<8} {s['consecutive_boards']:>4} "
+                f"{s['change_pct']:>+7.1f}% {s['price']:>8.2f} {seal_str:>12} "
+                f"{s['break_count']:>4} {s['industry']:<8} {fbt_str:<8}"
+            )
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[涨停池] 获取异常: {type(e).__name__}: {e}"

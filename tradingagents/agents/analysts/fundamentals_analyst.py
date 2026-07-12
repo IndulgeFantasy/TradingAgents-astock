@@ -12,6 +12,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_profit_forecast,
     get_stock_homepage,
     get_stock_industry_peers,
+    verify_stock_valuation,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -32,6 +33,7 @@ def create_fundamentals_analyst(llm):
             get_stock_homepage,
             get_stock_industry_peers,
             get_insider_transactions,
+            verify_stock_valuation,
         ]
 
         system_message = (
@@ -53,6 +55,7 @@ def create_fundamentals_analyst(llm):
             "\n- `get_stock_homepage(ticker)`：获取综合概要（PE动态/静态、PB、总市值、质押比例、大盘/小盘分类）-- 必采用途：PE(TTM)、PB、总市值、股权质押比例"
             "\n- `get_stock_industry_peers(ticker)`：获取同行业公司财务指标对标（行业排名、同行每股收益/ROE/毛利率对比）"
             "\n- `get_insider_transactions(ticker)`：获取大股东/内部人交易记录和持股变化，用于评估减持风险"
+            "\n- `verify_stock_valuation(code)`：使用精确十进制（Decimal）验算PE/PB/ROE，避免LLM心算浮点误差。自动从同花顺F10取数后验算"
             "\n\n撰写详尽的基本面研究报告，给出具体数据支撑的分析结论（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总关键财务指标和估值水平。"
             "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. PE（TTM）、PB、总市值"

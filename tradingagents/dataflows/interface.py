@@ -42,6 +42,8 @@ from .a_stock import (
     get_dragon_tiger_board as get_astock_dragon_tiger_board,
     get_lockup_expiry as get_astock_lockup_expiry,
     get_industry_comparison as get_astock_industry_comparison,
+    get_astock_chip_distribution,
+    get_astock_limit_up_pool,
 )
 
 # Configuration and routing logic
@@ -89,6 +91,8 @@ TOOLS_CATEGORIES = {
             "get_dragon_tiger_board",
             "get_lockup_expiry",
             "get_industry_comparison",
+            "get_chip_distribution",
+            "get_limit_up_pool",
         ]
     }
 }
@@ -175,6 +179,12 @@ VENDOR_METHODS = {
     },
     "get_industry_comparison": {
         "a_stock": get_astock_industry_comparison,
+    },
+    "get_chip_distribution": {
+        "a_stock": get_astock_chip_distribution,
+    },
+    "get_limit_up_pool": {
+        "a_stock": get_astock_limit_up_pool,
     },
 }
 

@@ -153,3 +153,36 @@ def get_industry_comparison(
         str: Industry performance ranking with key metrics
     """
     return route_to_vendor("get_industry_comparison", ticker, curr_date)
+
+
+@tool
+def get_chip_distribution(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+) -> str:
+    """
+    Retrieve chip distribution (筹码分布) for an A-stock.
+    Computes profit ratio, average cost, 90%/70% concentration zones
+    using a CYQ algorithm on 210 daily K-lines.
+    Shows chip health assessment (healthy/warning based on concentration and profit ratio).
+    Args:
+        ticker (str): A-stock code
+    Returns:
+        str: Chip distribution report with profit ratio, cost zones, concentration
+    """
+    return route_to_vendor("get_chip_distribution", ticker)
+
+
+@tool
+def get_limit_up_pool(
+    curr_date: Annotated[str, "Date in YYYY-MM-DD format, empty for today"] = "",
+) -> str:
+    """
+    Retrieve limit-up pool with consecutive board ladder (涨停池/连板梯队).
+    Shows all limit-up stocks sorted by consecutive boards (连板数) descending.
+    Includes seal amount, break count, first limit time, and industry.
+    Args:
+        curr_date (str): Date in YYYY-MM-DD format, empty string for today
+    Returns:
+        str: Limit-up pool with board ladder summary and top stocks table
+    """
+    return route_to_vendor("get_limit_up_pool", curr_date)

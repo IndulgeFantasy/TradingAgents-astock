@@ -8,6 +8,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_industry_comparison,
     get_insider_transactions,
     get_language_instruction,
+    get_limit_up_pool,
     get_news,
     get_northbound_flow,
     get_stock_kline_full,
@@ -34,6 +35,7 @@ def create_hot_money_tracker(llm):
             get_dragon_tiger_board,
             get_industry_comparison,
             get_stock_position,
+            get_limit_up_pool,
         ]
 
         system_message = (
@@ -62,6 +64,7 @@ def create_hot_money_tracker(llm):
             "\n- `get_dragon_tiger_board(ticker, curr_date)`：获取龙虎榜上榜记录、买卖席位明细（营业部）、机构参与情况"
             "\n- `get_stock_position(ticker)`：获取机构持股明细（哪些机构在买入/卖出、持仓占比变化），判断主力动向"
             "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，判断板块轮动）"
+            "\n- `get_limit_up_pool(curr_date)`：获取涨停池/连板梯队（连板数/封板资金/炸板次数/所属行业，判断市场情绪和游资接力热度）"
             "\n\n撰写详细的资金面分析报告，给出资金面总体判断（主力流入/主力流出/资金博弈/无明显信号）和短期资金面信号研判（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总量价信号、资金动向和结论。"
             "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. 近 5 日成交量变化趋势（放量/缩量/平稳）"
@@ -70,6 +73,7 @@ def create_hot_money_tracker(llm):
             "\n4. 当日是否上榜热门股及题材归因"
             "\n5. 资金面总体判断"
             "\n6. 机构持股明细（哪些机构在买入/卖出、持仓占比变化）-- 调用 get_stock_position 获取"
+            "\n7. 涨停池连板梯队（连板数/封板资金/炸板次数/所属行业）-- 调用 get_limit_up_pool(curr_date) 获取"
             + get_language_instruction()
         )
 

@@ -27,6 +27,8 @@ from tradingagents.agents.utils.signal_data_tools import (
     get_dragon_tiger_board,
     get_lockup_expiry,
     get_industry_comparison,
+    get_chip_distribution,
+    get_limit_up_pool,
 )
 from tradingagents.agents.utils.playwright_tools import (
     get_stock_basic,
@@ -39,6 +41,12 @@ from tradingagents.agents.utils.playwright_tools import (
     get_stock_kline_full,
     get_financial_quarterly,
     get_stock_levels,
+)
+from tradingagents.agents.utils.analysis_tools import (
+    analyze_pattern,
+)
+from tradingagents.agents.utils.financial_rigor import (
+    verify_stock_valuation,
 )
 
 
