@@ -53,6 +53,11 @@ _cache = {}
 # Chrome CDP 地址（playwright 通过 CDP 连接浏览器）
 _WENCAI_CDP = os.getenv("WENCAI_CDP", "http://127.0.0.1:9222")
 
+# Serialize all Chrome page operations: ThreadingHTTPServer spawns a thread per
+# request, but Chrome CDP cannot handle concurrent page creation reliably.
+# This lock ensures only one fetch_* runs at a time. Cached hits bypass it.
+_cdp_lock = threading.Lock()
+
 
 def _validate_code(code: str) -> str | None:
     """校验股票代码格式: 必须为 6 位数字。返回 None 表示合法，否则返回错误信息。"""
@@ -74,6 +79,28 @@ def _parse_sse_lines(text: str):
 
 
 # ── 缓存装饰器 ──
+def _cache_key(func_name, args, kwargs):
+    """Build cache key matching @cached decorator."""
+    return f"{func_name}:{args}:{ {k: v for k, v in kwargs.items() if v is not None} }"
+
+
+def _cache_lookup(func, args=(), kwargs=None):
+    """Check cache without calling func or acquiring _cdp_lock.
+    Returns (hit: bool, data). Cache hits bypass _cdp_lock entirely."""
+    kwargs = kwargs or {}
+    ttl = getattr(func, '_cached_ttl', 0)
+    if ttl <= 0:
+        return False, None
+    key = _cache_key(func.__name__, args, kwargs)
+    now = time.time()
+    entry = _cache.get(key)
+    if entry:
+        ts, data = entry
+        if now - ts < ttl:
+            return True, data
+    return False, None
+
+
 def cached(ttl=None):
     ttl = ttl or CACHE_TTL
     def decorator(func):
@@ -81,7 +108,7 @@ def cached(ttl=None):
         def wrapper(*args, **kwargs):
             if ttl <= 0:
                 return func(*args, **kwargs)
-            key = f"{func.__name__}:{args}:{ {k: v for k, v in kwargs.items() if v is not None} }"
+            key = _cache_key(func.__name__, args, kwargs)
             now = time.time()
             if key in _cache:
                 ts, data = _cache[key]
@@ -91,6 +118,7 @@ def cached(ttl=None):
             if isinstance(result, dict) and result.get("success"):
                 _cache[key] = (now, result)
             return result
+        wrapper._cached_ttl = ttl
         return wrapper
     return decorator
 
@@ -478,6 +506,16 @@ def fetch_market_overview():
                             logging.getLogger("playwright_service").warning(
                                 "fetch_market_overview: DOM extra data extraction failed: %s", e
                             )
+
+                    # 关闭当前页面，避免循环内页面泄漏
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    # 循环间隔: 让 Chrome CDP 回收资源，避免连续开关页面过快
+                    if idx < len(indices) - 1:
+                        import random
+                        await asyncio.sleep(1.5 + random.random() * 0.5)
 
                 if not results:
                     return {"success": False, "error": "获取大盘数据失败", "details": errors}
@@ -2149,9 +2187,21 @@ class DataHandler(BaseHTTPRequestHandler):
                             except (ValueError, TypeError):
                                 pass
                         kwargs[k] = v
-                result = func(*args, **kwargs)
+                # Cache hits bypass _cdp_lock (no Chrome access needed).
+                # Only cache misses (actual Chrome page operations) serialize.
+                hit, cached_data = _cache_lookup(func, args, kwargs)
+                if hit:
+                    result = cached_data
+                else:
+                    with _cdp_lock:
+                        result = func(*args, **kwargs)
             else:
-                result = func()
+                hit, cached_data = _cache_lookup(func)
+                if hit:
+                    result = cached_data
+                else:
+                    with _cdp_lock:
+                        result = func()
             try:
                 self._send_json(result)
             except Exception:
