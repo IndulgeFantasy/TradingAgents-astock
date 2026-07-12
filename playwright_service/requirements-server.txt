@@ -1,0 +1,4 @@
+# worktrade2 环境依赖（playwright_service/server.py 运行所需）
+# 不依赖 akshare，所有数据通过 playwright + Chrome CDP 抓取
+playwright>=1.40.0
+mcp_query_table>=0.2.0

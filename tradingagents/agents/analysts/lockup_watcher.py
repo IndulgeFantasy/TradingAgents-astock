@@ -1,11 +1,13 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
-    get_fundamentals,
     get_insider_transactions,
     get_language_instruction,
     get_lockup_expiry,
     get_news,
+    get_stock_basic,
+    get_stock_equity_history,
+    get_stock_holder,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -20,8 +22,10 @@ def create_lockup_watcher(llm):
         tools = [
             get_insider_transactions,
             get_news,
-            get_fundamentals,
             get_lockup_expiry,
+            get_stock_basic,
+            get_stock_holder,
+            get_stock_equity_history,
         ]
 
         system_message = (
@@ -32,24 +36,30 @@ def create_lockup_watcher(llm):
             "\n- **减持新规约束**：大股东(持股 5%+)每 90 天通过集中竞价减持不超过总股本 1%、大宗交易不超过 2%；董监高每年减持不超过持股 25%。"
             "\n- **减持预披露**：大股东/董监高减持需提前 15 个交易日披露减持计划(时间窗口、数量、方式)。已披露的减持计划是确定性利空。"
             "\n- **减持动力评估**：当前股价 vs 解禁成本的溢价倍数越高,减持动力越强。若股价低于解禁成本,减持概率大幅降低。"
-            "\n- **历史减持行为**：大股东过往减持频率和规模反映其套现意愿。频繁���持的大股东在新一轮解禁时减持概率更高。"
+            "\n- **历史减持行为**：大股东过往减持频率和规模反映其套现意愿。频繁减持的大股东在新一轮解禁时减持概率更高。"
             "\n\n分析方法："
             "\n1. 调用 get_insider_transactions 获取股东/内部人交易记录和持股变化"
-            "\n2. 调用 get_fundamentals 获取公司股本结构和大股东持股比例"
-            "\n3. 调用 get_news 搜索解禁、减持计划、股东变动相关公告和新闻"
-            "\n4. 综合评估未来 1-3 个月的减持压力等级"
+            "\n2. 调用 get_stock_basic(ticker) 获取股本结构（总股本/流通股本/限售股/多期变化）"
+            "\n3. 调用 get_stock_holder(ticker) 获取股东人数变化和十大流通股东变动"
+            "\n4. 调用 get_stock_equity_history(ticker) 获取股本历史变动（回购/送转/增发及原因）"
+            "\n5. 调用 get_news 搜索解禁、减持计划、股东变动相关公告和新闻"
+            "\n6. 综合评估未来 1-3 个月的减持压力等级"
             "\n\n请使用以下工具："
             "\n- `get_insider_transactions`：获取股东和内部人交易记录"
-            "\n- `get_fundamentals`：获取公司股本结构信息"
+            "\n- `get_stock_basic(ticker)`：获取股本结构（总股本、流通股本、限售股、多期历史变化），用于判断解禁比例和减持上限"
+            "\n- `get_stock_holder(ticker)`：获取股东人数变化（筹码集中度）和前十大流通股东变动"
+            "\n- `get_stock_equity_history(ticker)`：获取股本历史变动（回购/增发/送转等及原因）"
             "\n- `get_news(ticker, start_date, end_date)`：搜索解禁/减持相关新闻和公告，ticker 必须使用目标股票的 6 位代码"
             "\n- `get_lockup_expiry(ticker, curr_date)`：获取限售解禁日历（历史解禁记录+未来90天待解禁计划，含解禁数量/占比/影响评估）"
             "\n\n撰写详细的解禁/减持风险评估报告,给出减持压力总体评级(重大压力/中等压力/轻微压力/无明显压力),并估算潜在减持规模和时间窗口。报告末尾附 Markdown 表格列出关键解禁/减持事件、规模和影响评估。"
-            "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
+            "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. 近 6 个月内部人/大股东交易记录（增持/减持/无变动）"
             "\n2. 前十大股东持股变化趋势"
             "\n3. 解禁/减持相关新闻及公告"
             "\n4. 减持压力评级（重大压力/中等压力/轻微压力/无明显压力）"
             "\n5. 未来 3 个月潜在减持风险评估"
+            "\n6. 股东人数变化及筹码集中度（调用 get_stock_holder 获取）"
+            "\n7. 股本历史变动及变动原因（调用 get_stock_equity_history 获取）"
             + get_language_instruction()
         )
 

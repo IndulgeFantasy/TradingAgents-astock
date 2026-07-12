@@ -10,7 +10,8 @@ from tradingagents.agents.utils.agent_utils import (
     get_language_instruction,
     get_news,
     get_northbound_flow,
-    get_stock_data,
+    get_stock_kline_full,
+    get_stock_position,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -23,7 +24,7 @@ def create_hot_money_tracker(llm):
         instrument_context = build_instrument_context(state["company_of_interest"])
 
         tools = [
-            get_stock_data,
+            get_stock_kline_full,
             get_news,
             get_insider_transactions,
             get_hot_stocks,
@@ -32,6 +33,7 @@ def create_hot_money_tracker(llm):
             get_fund_flow,
             get_dragon_tiger_board,
             get_industry_comparison,
+            get_stock_position,
         ]
 
         system_message = (
@@ -43,30 +45,31 @@ def create_hot_money_tracker(llm):
             "\n- **板块资金流向**：资金从一个板块撤出往往流入另一个板块，跟踪轮动节奏有助于预判下一个热点"
             "\n- **大股东/机构行为**：大股东增减持、机构调研频次变化、定增/配股等融资行为反映内部人态度"
             "\n\n分析方法："
-            "\n1. 先调用 get_stock_data 获取近期 K 线和成交量数据，识别量价异动"
+            "\n1. 先调用 get_stock_kline_full(code, days) 获取近期 K 线和成交量数据（含换手率），识别量价异动"
             "\n2. 调用 get_insider_transactions 获取股东/内部人交易记录，判断主力动向"
             "\n3. 调用 get_news 搜索游资、龙虎榜、主力资金相关新闻"
             "\n4. 调用 get_hot_stocks 获取当日强势股及题材归因（同花顺编辑部人工标注），识别热点板块轮动"
-            "\n5. 调用 get_northbound_flow 获取北向资金（沪深股通）实时分钟级流向，判断外资态度"
+            "\n5. 调用 get_northbound_flow 获取北向资金流向（注意：交易所自2024年起停止发布北向实时净买入数据，工具会返回「已停止发布」提示和南向资金数据作为参考）"
             "\n6. 综合判断当前资金博弈格局：主力吸筹 / 主力出货 / 游资接力 / 散户主导"
             "\n\n请使用以下工具："
-            "\n- `get_stock_data`：获取 K 线和成交量数据"
+            "\n- `get_stock_kline_full(code, days)`：获取 K 线和成交量数据（含换手率/涨跌幅）"
             "\n- `get_news(ticker, start_date, end_date)`：搜索游资/资金流向相关新闻，ticker 必须使用目标股票的 6 位代码"
             "\n- `get_insider_transactions`：获取股东和内部人交易数据"
             "\n- `get_hot_stocks(curr_date)`：获取当日涨停股 + 题材归因 reason tags（同花顺独家）"
-            "\n- `get_northbound_flow(curr_date)`：获取北向资金实时分钟级流向（沪股通+深股通累计净买入）"
-            "\n- `get_concept_blocks(ticker)`：获取个股所属概念板块/行业分类/地域（百度股市通，含当日涨幅）"
-            "\n- `get_fund_flow(ticker, curr_date)`：获取个股主力/散户资金流向（分钟级实时+20日历史，超大单/大单/中单/小单净流入）"
+            "\n- `get_northbound_flow(curr_date)`：获取北向资金流向（⚠️ 交易所自2024年起停止发布北向实时净买入数据，返回「已停止发布」提示+南向资金数据作为参考）"
+            "\n- `get_concept_blocks(ticker)`：获取个股所属概念板块列表（同花顺问财，精确到个股概念归属）"
+            "\n- `get_fund_flow(ticker, curr_date)`：获取个股近30日主力资金净流入时间序列+所属概念板块（同花顺问财，取代原东财push2时序数据）"
             "\n- `get_dragon_tiger_board(ticker, curr_date)`：获取龙虎榜上榜记录、买卖席位明细（营业部）、机构参与情况"
+            "\n- `get_stock_position(ticker)`：获取机构持股明细（哪些机构在买入/卖出、持仓占比变化），判断主力动向"
             "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，判断板块轮动）"
             "\n\n撰写详细的资金面分析报告，给出资金面总体判断（主力流入/主力流出/资金博弈/无明显信号）和短期资金面信号研判（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总量价信号、资金动向和结论。"
-            "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
+            "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. 近 5 日成交量变化趋势（放量/缩量/平稳）"
-            "\n2. 当日北向资金净流入金额（沪股通 + 深股通）"
-            "\n3. 个股主力资金净流入（超大单 + 大单）"
-            "\n4. 所属概念板块及当日板块涨幅"
-            "\n5. 当日是否上榜热门股及题材归因"
-            "\n6. 资金面总体判断"
+            "\n2. 个股主力资金净流入（超大单 + 大单）"
+            "\n3. 所属概念板块及当日板块涨幅"
+            "\n4. 当日是否上榜热门股及题材归因"
+            "\n5. 资金面总体判断"
+            "\n6. 机构持股明细（哪些机构在买入/卖出、持仓占比变化）-- 调用 get_stock_position 获取"
             + get_language_instruction()
         )
 

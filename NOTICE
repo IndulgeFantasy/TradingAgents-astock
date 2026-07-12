@@ -10,7 +10,7 @@ Licensed under the Apache License, Version 2.0
 (https://www.apache.org/licenses/LICENSE-2.0)
 
 Modifications in this fork include:
-- A-stock (China mainland) data layer using mootdx, Tencent Finance, and akshare
+- A-stock (China mainland) data layer using mootdx, Tencent Finance, direct HTTP APIs, and playwright (同花顺F10/问财)
 - Three new A-stock specific analyst agents (Policy, Hot Money, Lockup)
 - A-stock trading constraints (T+1, price limits, lot sizes) in Trader and PM
 - Chinese language output support

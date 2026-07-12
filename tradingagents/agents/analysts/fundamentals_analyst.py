@@ -3,12 +3,15 @@ from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_balance_sheet,
     get_cashflow,
+    get_financial_quarterly,
     get_fundamentals,
     get_income_statement,
     get_industry_comparison,
     get_insider_transactions,
     get_language_instruction,
     get_profit_forecast,
+    get_stock_homepage,
+    get_stock_industry_peers,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -25,6 +28,10 @@ def create_fundamentals_analyst(llm):
             get_income_statement,
             get_profit_forecast,
             get_industry_comparison,
+            get_financial_quarterly,
+            get_stock_homepage,
+            get_stock_industry_peers,
+            get_insider_transactions,
         ]
 
         system_message = (
@@ -36,14 +43,18 @@ def create_fundamentals_analyst(llm):
             "\n- **财报披露节奏**：一季报（4月底前）、半年报（8月底前）、三季报（10月底前）、年报（次年4月底前）。分析时注意数据的时效性。"
             "\n- **特殊风险关注**：商誉减值（并购后遗症）、股权质押比例、大股东减持计划、关联交易规模。"
             "\n\n请使用以下工具获取数据："
-            "\n- `get_fundamentals`：获取公司综合基本面信息（PE/PB/总市值/季报财务快照/一致预期EPS/前向PE/PEG等）"
-            "\n- `get_profit_forecast`：获取机构一致预期EPS详情（覆盖机构数、EPS区间、前向PE、PEG、PE消化时间）"
+            "\n- `get_fundamentals`：获取实时估值数据（PE/PB/总市值/流通市值/换手率等，来源：腾讯行情API）"
+            "\n- `get_profit_forecast`：获取机构一致预期EPS详情（同花顺F10，含机构预测、EPS区间、前向PE、PEG、PE消化时间）"
             "\n- `get_balance_sheet`：资产负债表详细数据"
             "\n- `get_cashflow`：现金流量表详细数据"
             "\n- `get_income_statement`：利润表详细数据"
             "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，用于估值对标和行业定位）"
+            "\n- `get_financial_quarterly(ticker)`：获取最近4期财务数据（营收/净利润/扣非净利润同比增长率、ROE、毛利率、净利率、资产负债率、每股收益、每股经营现金流等）-- 必采用途：营收同比增长率、归母净利润同比增长率、ROE、资产负债率、经营现金流/净利润比"
+            "\n- `get_stock_homepage(ticker)`：获取综合概要（PE动态/静态、PB、总市值、质押比例、大盘/小盘分类）-- 必采用途：PE(TTM)、PB、总市值、股权质押比例"
+            "\n- `get_stock_industry_peers(ticker)`：获取同行业公司财务指标对标（行业排名、同行每股收益/ROE/毛利率对比）"
+            "\n- `get_insider_transactions(ticker)`：获取大股东/内部人交易记录和持股变化，用于评估减持风险"
             "\n\n撰写详尽的基本面研究报告，给出具体数据支撑的分析结论（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总关键财务指标和估值水平。"
-            "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
+            "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. PE（TTM）、PB、总市值"
             "\n2. 营收同比增长率"
             "\n3. 归母净利润及同比增长率"

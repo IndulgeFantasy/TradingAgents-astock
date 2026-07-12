@@ -95,6 +95,7 @@ TOOLS_CATEGORIES = {
 
 VENDOR_LIST = [
     "a_stock",
+    "playwright",
     "yfinance",
     "alpha_vantage",
 ]
@@ -150,7 +151,7 @@ VENDOR_METHODS = {
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
     },
-    # signal_data (A-stock only)
+    # signal_data (A-stock only, with optional playwright enrichment)
     "get_profit_forecast": {
         "a_stock": get_astock_profit_forecast,
     },
@@ -228,3 +229,27 @@ def route_to_vendor(method: str, *args, **kwargs):
             continue  # Only rate limits trigger fallback
 
     raise RuntimeError(f"No available vendor for '{method}'")
+
+
+# ── Playwright vendor registration (deferred to avoid circular import) ──
+# playwright_tools.py imports from agents.utils which imports from interface,
+# so we register the playwright vendor implementations at module load time
+# using a lazy import that executes after all top-level imports are resolved.
+def _register_playwright_vendor():
+    try:
+        from tradingagents.agents.utils.playwright_tools import (
+            get_concept_blocks_playwright,
+            get_fund_flow_playwright,
+            get_profit_forecast_playwright,
+        )
+        VENDOR_METHODS["get_profit_forecast"]["playwright"] = get_profit_forecast_playwright
+        VENDOR_METHODS["get_concept_blocks"]["playwright"] = get_concept_blocks_playwright
+        VENDOR_METHODS["get_fund_flow"]["playwright"] = get_fund_flow_playwright
+    except ImportError as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "playwright vendor not registered: %s", e
+        )
+
+
+_register_playwright_vendor()

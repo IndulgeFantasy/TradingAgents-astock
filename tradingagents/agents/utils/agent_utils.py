@@ -28,6 +28,18 @@ from tradingagents.agents.utils.signal_data_tools import (
     get_lockup_expiry,
     get_industry_comparison,
 )
+from tradingagents.agents.utils.playwright_tools import (
+    get_stock_basic,
+    get_stock_homepage,
+    get_stock_industry_peers,
+    get_stock_holder,
+    get_stock_equity_history,
+    get_stock_position,
+    get_market_context,
+    get_stock_kline_full,
+    get_financial_quarterly,
+    get_stock_levels,
+)
 
 
 def get_language_instruction() -> str:
