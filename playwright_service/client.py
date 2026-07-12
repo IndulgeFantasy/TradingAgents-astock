@@ -34,6 +34,10 @@ DEFAULT_TIMEOUT = int(os.getenv("AKS_TIMEOUT", "30"))
 CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("AKS_CIRCUIT_THRESHOLD", "5"))
 CIRCUIT_COOLDOWN = int(os.getenv("AKS_CIRCUIT_COOLDOWN", "60"))
 
+# Min interval between requests to playwright_service (seconds).
+# Each request opens/closes a Chrome page via CDP, too fast will crash Chrome.
+PW_MIN_INTERVAL = float(os.getenv("PW_MIN_INTERVAL", "1.0"))
+
 
 class PlaywrightClient:
     """Playwright 数据服务客户端"""
@@ -44,6 +48,7 @@ class PlaywrightClient:
         self._fail_count = 0
         self._circuit_open_until = 0.0
         self._lock = threading.Lock()
+        self._last_call = 0.0
 
     def _is_circuit_open(self) -> bool:
         with self._lock:
@@ -67,7 +72,14 @@ class PlaywrightClient:
             )
 
     def _get(self, path: str, params: dict = None, timeout: int = None) -> dict:
-        """发送 GET 请求并返回 JSON"""
+        """Send GET request with throttling to protect Chrome CDP."""
+        # Throttle: enforce min interval between requests
+        with self._lock:
+            elapsed = time.time() - self._last_call
+            if elapsed < PW_MIN_INTERVAL:
+                time.sleep(PW_MIN_INTERVAL - elapsed)
+            self._last_call = time.time()
+
         if self._is_circuit_open():
             with self._lock:
                 remaining = int(self._circuit_open_until - time.time())

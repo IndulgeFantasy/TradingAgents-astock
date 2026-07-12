@@ -24,6 +24,7 @@ import math
 import random
 import re as _re
 import socket
+import threading
 import time
 import uuid
 import urllib.request
@@ -274,6 +275,7 @@ _EM_SESSION.headers.update({"User-Agent": _UA})
 # 两次东财请求最小间隔(秒)；批量多 Agent 场景可设环境变量 EM_MIN_INTERVAL=1.5~2 降速。
 _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
+_em_lock = threading.Lock()  # 保护 _em_last_call 的串行限流
 
 
 def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
@@ -283,15 +285,18 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     串行限流：与上次东财请求间隔 < EM_MIN_INTERVAL 时 sleep 补足 + 0.1~0.5s 随机抖动。
     传入的 headers 会覆盖 session 默认 UA（用于保留各端点自己的 Referer/Origin）。
     """
-    wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-    if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
+    with _em_lock:
+        wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        _em_last_call[0] = time.time()
     try:
         return _EM_SESSION.get(
             url, params=params, headers=headers, timeout=timeout, **kwargs
         )
     finally:
-        _em_last_call[0] = time.time()
+        with _em_lock:
+            _em_last_call[0] = time.time()
 
 
 def _eastmoney_datacenter(

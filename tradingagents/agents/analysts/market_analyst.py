@@ -57,7 +57,7 @@ def create_market_analyst(llm):
 
 📊 支撑位/压力位：调用 get_stock_levels(code) 获取关键价位。支撑位是下跌时的潜在止跌位置（止损参考），压力位是上涨时的潜在受阻位置（止盈参考），结合当前股价判断盈亏比。
 
-📈 筹码分布：调用 get_chip_distribution(code) 获取筹码分布数据。关键指标：
+📈 筹码分布：调用 get_chip_distribution(ticker) 获取筹码分布数据。关键指标：
 - 获利比例 >90% 时警惕抛压风险
 - 90%集中度 <15% 表示筹码集中（主力控盘），>25% 表示分散
 - 当前价 vs 平均成本：高于成本10%以上获利盘多，低于成本10%以上套牢盘多
@@ -120,7 +120,7 @@ MACD 类：
 10. 北向资金状况（净买入自2024年起已停止发布，需原样写「已停止发布」；北向成交额合计仍可用）-- 调用 get_market_context() 获取
 11. 南向资金净买入（沪港通/深港通，外资流向港股的参考指标）-- 调用 get_market_context() 获取
 12. 领涨板块（当日热门板块轮动信号，top 3）-- 调用 get_market_context() 获取
-13. 筹码分布（获利比例/集中度/平均成本/健康度）-- 调用 get_chip_distribution(code) 获取
+13. 筹码分布（获利比例/集中度/平均成本/健康度）-- 调用 get_chip_distribution(ticker) 获取
 14. K线形态（十字星/锤子线/吞没/早晨之星等12种形态）-- 调用 analyze_pattern(code) 获取"""
             + get_language_instruction()
         )

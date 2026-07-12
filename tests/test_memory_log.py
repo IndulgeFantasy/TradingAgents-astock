@@ -54,8 +54,33 @@ def _resolve_entry(log, ticker, date, decision, reflection="Good call."):
 
 
 def _price_df(prices):
-    """Minimal DataFrame matching yfinance .history() output shape."""
+    """Minimal DataFrame matching yfinance .history() output shape (legacy)."""
     return pd.DataFrame({"Close": prices})
+
+
+def _kline_data(prices, start_date="2026-01-05"):
+    """Build synthetic K-line dicts matching _em_fetch_klines output.
+
+    Each dict has: date, open, close, high, low, volume, amount, amplitude, pct_chg, turnover.
+    Dates are consecutive trading days starting from start_date.
+    """
+    from datetime import datetime, timedelta
+    base = datetime.strptime(start_date, "%Y-%m-%d")
+    klines = []
+    for i, p in enumerate(prices):
+        klines.append({
+            "date": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+            "open": p - 0.5,
+            "close": p,
+            "high": p + 0.5,
+            "low": p - 1.0,
+            "volume": 100000.0,
+            "amount": 1000000.0,
+            "amplitude": 1.5,
+            "pct_chg": 0.5,
+            "turnover": 2.0,
+        })
+    return klines
 
 
 def _make_pm_state(past_context=""):
@@ -489,51 +514,42 @@ class TestDeferredReflection:
         stock_prices = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
         bench_prices = [4000.0, 4020.0, 4040.0, 4030.0, 4050.0, 4060.0]
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            def _make_ticker(sym):
-                m = MagicMock()
-                m.history.return_value = _price_df(bench_prices if sym == "000300.SS" else stock_prices)
-                return m
-            mock_ticker_cls.side_effect = _make_ticker
+        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
+            def _fetch(code, count=250):
+                return _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices)
+            mock_fetch.side_effect = _fetch
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "688017", "2026-01-05")
         assert raw is not None and alpha is not None and days is not None
         assert isinstance(raw, float) and isinstance(alpha, float) and isinstance(days, int)
         assert days == 5
 
     def test_fetch_returns_too_recent(self):
-        """Only 1 data point available → returns (None, None, None), no crash."""
+        """Only 1 data point available -> returns (None, None, None), no crash."""
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            m = MagicMock()
-            m.history.return_value = _price_df([100.0])
-            mock_ticker_cls.return_value = m
-            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-04-19")
+        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
+            mock_fetch.return_value = _kline_data([100.0])
+            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "688017", "2026-04-19")
         assert raw is None and alpha is None and days is None
 
     def test_fetch_returns_delisted(self):
-        """Empty DataFrame → returns (None, None, None), no crash."""
+        """Empty K-line list -> returns (None, None, None), no crash."""
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            m = MagicMock()
-            m.history.return_value = pd.DataFrame({"Close": []})
-            mock_ticker_cls.return_value = m
+        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
+            mock_fetch.return_value = []
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "XXXXXFAKE", "2026-01-10")
         assert raw is None and alpha is None and days is None
 
     def test_fetch_returns_benchmark_shorter_than_stock(self):
-        """CSI 300 having fewer rows than the stock must not raise IndexError."""
+        """Benchmark having fewer rows than the stock must not raise IndexError."""
         stock_prices = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
         bench_prices = [4000.0, 4020.0, 4030.0]
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            def _make_ticker(sym):
-                m = MagicMock()
-                m.history.return_value = _price_df(bench_prices if sym == "000300.SS" else stock_prices)
-                return m
-            mock_ticker_cls.side_effect = _make_ticker
+        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
+            def _fetch(code, count=250):
+                return _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices)
+            mock_fetch.side_effect = _fetch
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "688017", "2026-01-05")
-        assert raw is not None and alpha is not None and days is not None
-        assert days == 2
+        assert raw is None and alpha is None and days is None
 
     # TradingAgentsGraph._resolve_pending_entries
 

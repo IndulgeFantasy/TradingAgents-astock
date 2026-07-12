@@ -114,6 +114,21 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Custom model ID", "custom"),
         ],
     },
+    "volcengine": {
+        "quick": [
+            ("GLM-5.2 - 1M context, reasoning", "glm-5.2"),
+            ("DeepSeek V4 Flash - Fast, 1M context", "deepseek-v4-flash"),
+            ("Doubao Seed 2.0 Lite - Fast, 256K", "doubao-seed-2.0-lite"),
+            ("Custom model ID", "custom"),
+        ],
+        "deep": [
+            ("GLM-5.2 - 1M context, reasoning", "glm-5.2"),
+            ("DeepSeek V4 Pro - Strongest reasoning, 1M context", "deepseek-v4-pro"),
+            ("Doubao Seed 2.0 Pro - 256K, multimodal", "doubao-seed-2.0-pro"),
+            ("MiniMax M3 - 512K, multimodal", "minimax-m3"),
+            ("Custom model ID", "custom"),
+        ],
+    },
     # OpenRouter: fetched dynamically. Azure: any deployed model name.
     "ollama": {
         "quick": [

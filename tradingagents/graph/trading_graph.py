@@ -7,8 +7,6 @@ import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
 
-import yfinance as yf
-
 logger = logging.getLogger(__name__)
 
 from langgraph.prebuilt import ToolNode
@@ -45,6 +43,20 @@ from tradingagents.agents.utils.agent_utils import (
     get_dragon_tiger_board,
     get_lockup_expiry,
     get_industry_comparison,
+    get_chip_distribution,
+    get_limit_up_pool,
+    analyze_pattern,
+    verify_stock_valuation,
+    get_stock_basic,
+    get_stock_homepage,
+    get_stock_industry_peers,
+    get_stock_holder,
+    get_stock_equity_history,
+    get_stock_position,
+    get_market_context,
+    get_stock_kline_full,
+    get_financial_quarterly,
+    get_stock_levels,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -161,28 +173,34 @@ class TradingAgentsGraph:
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
-        """Create tool nodes for different data sources using abstract methods."""
+        """Create tool nodes for different data sources.
+
+        Each ToolNode must match the analyst's tools list exactly.
+        If the LLM knows about a tool (via bind_tools), the ToolNode must
+        be able to execute it, otherwise LangGraph raises 'tool not found'.
+        """
         return {
             "market": ToolNode(
                 [
-                    # Core stock data tools
-                    get_stock_data,
-                    # Technical indicators
+                    get_stock_kline_full,
                     get_indicators,
+                    get_market_context,
+                    get_stock_levels,
+                    get_chip_distribution,
+                    analyze_pattern,
                 ]
             ),
             "social": ToolNode(
                 [
-                    # News tools for social media analysis
                     get_news,
+                    get_fund_flow,
+                    get_market_context,
                 ]
             ),
             "news": ToolNode(
                 [
-                    # News and insider information
                     get_news,
                     get_global_news,
-                    get_insider_transactions,
                 ]
             ),
             "fundamentals": ToolNode(
@@ -193,6 +211,11 @@ class TradingAgentsGraph:
                     get_income_statement,
                     get_profit_forecast,
                     get_industry_comparison,
+                    get_financial_quarterly,
+                    get_stock_homepage,
+                    get_stock_industry_peers,
+                    get_insider_transactions,
+                    verify_stock_valuation,
                 ]
             ),
             "policy": ToolNode(
@@ -203,7 +226,7 @@ class TradingAgentsGraph:
             ),
             "hot_money": ToolNode(
                 [
-                    get_stock_data,
+                    get_stock_kline_full,
                     get_news,
                     get_insider_transactions,
                     get_hot_stocks,
@@ -212,14 +235,18 @@ class TradingAgentsGraph:
                     get_fund_flow,
                     get_dragon_tiger_board,
                     get_industry_comparison,
+                    get_stock_position,
+                    get_limit_up_pool,
                 ]
             ),
             "lockup": ToolNode(
                 [
                     get_insider_transactions,
                     get_news,
-                    get_fundamentals,
                     get_lockup_expiry,
+                    get_stock_basic,
+                    get_stock_holder,
+                    get_stock_equity_history,
                 ]
             ),
         }
@@ -229,30 +256,66 @@ class TradingAgentsGraph:
     ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
+        Uses A-stock direct HTTP APIs (Eastmoney push2his) instead of yfinance,
+        which is unreliable in China mainland networks.
+
         Returns (raw_return, alpha_return, actual_holding_days) or
         (None, None, None) if price data is unavailable (too recent, delisted,
         or network error).
         """
         try:
-            start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
-            end_str = end.strftime("%Y-%m-%d")
+            from tradingagents.dataflows.a_stock import _em_fetch_klines, _normalize_ticker
+            from tradingagents.dataflows.utils import safe_ticker_component
 
-            stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
-            benchmark = yf.Ticker("000300.SS").history(start=trade_date, end=end_str)
-
-            if len(stock) < 2 or len(benchmark) < 2:
+            code = safe_ticker_component(ticker)
+            if not code or len(code) != 6:
                 return None, None, None
 
-            actual_days = min(holding_days, len(stock) - 1, len(benchmark) - 1)
-            raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
-            )
-            bench_ret = float(
-                (benchmark["Close"].iloc[actual_days] - benchmark["Close"].iloc[0])
-                / benchmark["Close"].iloc[0]
-            )
+            # Fetch enough K-lines to cover trade_date + holding_days
+            # 250 trading days ~ 1 year, enough to find any date within the last year
+            stock_klines = _em_fetch_klines(code, count=250)
+            # Benchmark: CSI 300 index (000300)
+            bench_klines = _em_fetch_klines("000300", count=250)
+
+            if not stock_klines or not bench_klines:
+                return None, None, None
+
+            # Find the index of trade_date (or the closest trading day after it)
+            trade_date_str = trade_date.replace("-", "")
+            trade_date_iso = trade_date  # YYYY-MM-DD
+
+            def _find_closest(klines, target_date):
+                """Find index of the first K-line on or after target_date."""
+                for i, k in enumerate(klines):
+                    if k["date"] >= target_date:
+                        return i
+                return None
+
+            stock_idx = _find_closest(stock_klines, trade_date_iso)
+            bench_idx = _find_closest(bench_klines, trade_date_iso)
+
+            if stock_idx is None or bench_idx is None:
+                return None, None, None
+
+            # Need at least holding_days+1 records from the start point
+            stock_end = stock_idx + holding_days + 1
+            bench_end = bench_idx + holding_days + 1
+
+            if stock_end > len(stock_klines) or bench_end > len(bench_klines):
+                # Price data not available yet (too recent)
+                return None, None, None
+
+            actual_days = holding_days
+            stock_start_price = stock_klines[stock_idx]["close"]
+            stock_end_price = stock_klines[stock_end - 1]["close"]
+            bench_start_price = bench_klines[bench_idx]["close"]
+            bench_end_price = bench_klines[bench_end - 1]["close"]
+
+            if stock_start_price <= 0 or bench_start_price <= 0:
+                return None, None, None
+
+            raw = float((stock_end_price - stock_start_price) / stock_start_price)
+            bench_ret = float((bench_end_price - bench_start_price) / bench_start_price)
             alpha = raw - bench_ret
             return raw, alpha, actual_days
         except Exception as e:

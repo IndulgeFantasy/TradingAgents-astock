@@ -20,6 +20,7 @@ from web.history import (
 _PROVIDERS: list[tuple[str, str]] = [
     ("MiniMax（推荐·国内直连）", "minimax"),
     ("DeepSeek", "deepseek"),
+    ("Volcengine (Ark)", "volcengine"),
     ("通义千问 Qwen", "qwen"),
     ("智谱 GLM", "glm"),
     ("OpenAI", "openai"),
@@ -120,7 +121,10 @@ def _render_analysis_controls(raw_ticker: str, trade_date_value: date) -> None:
             if tracker is not None:
                 tracker.mark_stopped()
                 st.session_state["tracker"] = None
-            _clear_analysis_artifacts(target_ticker, target_date)
+            try:
+                _clear_analysis_artifacts(target_ticker, target_date)
+            except Exception:
+                pass
 
         st.session_state["viewing_history"] = None
         st.success("已清空当前进度；下一次开始分析会从头生成。")
@@ -180,13 +184,14 @@ def _render_llm_config() -> None:
         key="llm_base_url",
         placeholder="例: https://your-proxy.com/v1",
         help=(
-            "通过第三方中转/代理访问 Claude、OpenAI 等模型时填写网关地址；"
-            "留空则用所选供应商的官方地址。API Key 仍从 .env 读取，"
-            "且每个供应商用各自的环境变量——"
-            "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、"
-            "通义=DASHSCOPE_API_KEY、智谱=ZHIPU_API_KEY、MiniMax=MINIMAX_API_KEY、"
-            "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY。"
-            "也可在 .env 里设 BACKEND_URL 代替此处。"
+            "Through third-party proxy / gateway to access Claude, OpenAI, etc; "
+            "leave empty to use the provider default URL. API Key is read from .env, "
+            "each provider uses its own env var: "
+            "OpenAI=OPENAI_API_KEY, DeepSeek=DEEPSEEK_API_KEY, "
+            "Qwen=DASHSCOPE_API_KEY, GLM=ZHIPU_API_KEY, MiniMax=MINIMAX_API_KEY, "
+            "Claude=ANTHROPIC_API_KEY, OpenRouter=OPENROUTER_API_KEY, xAI=XAI_API_KEY, "
+            "Volcengine=VOLCENGINE_API_KEY. "
+            "You can also set BACKEND_URL in .env instead."
         ),
     )
 

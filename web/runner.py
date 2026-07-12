@@ -110,8 +110,14 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
 
     try:
         def _close_and_discard() -> None:
-            graph.close_graph_run()
-            _discard_stopped_run(ticker, trade_date, config, tracker)
+            try:
+                graph.close_graph_run()
+            except Exception:
+                pass
+            try:
+                _discard_stopped_run(ticker, trade_date, config, tracker)
+            except Exception:
+                traceback.print_exc()
 
         if tracker.stop_requested:
             _close_and_discard()
@@ -127,6 +133,11 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
                 chunk = next(stream)
             except StopIteration:
                 break
+            except Exception:
+                if tracker.stop_requested:
+                    _close_and_discard()
+                    return
+                raise
 
             if tracker.stop_requested:
                 _close_and_discard()
@@ -163,7 +174,10 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
         tracker.mark_complete(last_chunk, signal)
         clear_incomplete_task(ticker, trade_date)
     finally:
-        graph.close_graph_run()
+        try:
+            graph.close_graph_run()
+        except Exception:
+            pass
 
 
 def run_analysis_in_thread(

@@ -2,7 +2,7 @@
 
 <p align="center">
   基于 <a href="https://github.com/TauricResearch/TradingAgents">TauricResearch/TradingAgents</a>（65K ⭐）的 A 股深度特化 fork<br>
-  全 Apache 2.0 开源 · pip install 即跑 · 零外部服务依赖
+  全 Apache 2.0 开源 · pip install 即跑 · 零外部数据库依赖
 </p>
 
 <p align="center">
@@ -140,7 +140,9 @@
 
 ---
 
-> **数据源优先级 & 东财防封（v0.2.11）**：行情 / K线 / 市值 / 财务能从 mootdx（通达信 TCP，不封 IP）或腾讯拿到的，一律走它们；东财只用于它独有的数据（龙虎榜 / 解禁 / 资金流 / 板块 / 个股新闻等）。所有东财请求统一走内置节流入口 `_em_get()`：串行限流（默认间隔 ≥1s + 0.1~0.5s 随机抖动）+ 复用 Keep-Alive 会话，多 Agent 跑批量分析不再触发临时封 IP（东财风控实测：每秒 >5 / 并发 ≥10 / 1 分钟 ≥200 触发封禁）。批量场景可设环境变量 `EM_MIN_INTERVAL=1.5~2` 进一步降速。**仅东财限流，mootdx / 腾讯 / 新浪 / 同花顺 / 财联社 / 百度 不受影响。**
+> **数据源优先级 & 东财防封（v0.2.19 加 threading.Lock 线程安全）**：行情 / K线 / 市值 / 财务能从 mootdx（通达信 TCP，不封 IP）或腾讯拿到的，一律走它们；东财只用于它独有的数据（龙虎榜 / 解禁 / 资金流 / 板块 / 个股新闻 / 筹码分布 / 涨停池等）。所有东财请求统一走内置节流入口 `_em_get()`：`threading.Lock` 保护串行限流（默认间隔 ≥1s + 0.1~0.5s 随机抖动）+ 复用 Keep-Alive 会话，Web UI 多 analyst 并发安全。批量场景可设环境变量 `EM_MIN_INTERVAL=1.5~2` 降速。
+
+> **playwright_service 数据服务（可选）**：同花顺F10/问财等纯前端渲染页面需要独立 HTTP 服务（`playwright_service/`，跑在 worktrade2 conda 环境）。主程序通过 `PlaywrightClient` HTTP 调用，不直接依赖 playwright 库。内置熔断器保护（5次连续失败后熔断60秒）。未启动时自动降级到 a_stock 直连 HTTP 数据源。
 
 ## 快速开始
 
@@ -321,40 +323,45 @@ TradingAgents-Astock/
 ├── tradingagents/
 │   ├── agents/
 │   │   ├── analysts/          # 7 个分析师
-│   │   │   ├── market_analyst.py
-│   │   │   ├── social_media_analyst.py
-│   │   │   ├── news_analyst.py
-│   │   │   ├── fundamentals_analyst.py
-│   │   │   ├── policy_analyst.py        # A 股特化
-│   │   │   ├── hot_money_tracker.py     # A 股特化
-│   │   │   └── lockup_watcher.py        # A 股特化
+│   │   │   ├── market_analyst.py        # 技术分析（K线/指标/筹码/形态）
+│   │   │   ├── social_media_analyst.py  # 情绪分析
+│   │   │   ├── news_analyst.py          # 新闻分析
+│   │   │   ├── fundamentals_analyst.py  # 基本面（含精确估值验算）
+│   │   │   ├── policy_analyst.py        # A 股特化：政策分析
+│   │   │   ├── hot_money_tracker.py     # A 股特化：游资追踪（含涨停池）
+│   │   │   └── lockup_watcher.py        # A 股特化：解禁监控
 │   │   ├── researchers/       # Bull / Bear 研究员
 │   │   ├── risk_mgmt/         # 激进 / 保守 / 中立 辩手
 │   │   ├── managers/          # Research Manager + Portfolio Manager
 │   │   ├── trader/            # Trader（A 股交易约束）
+│   │   ├── quality_gate.py    # 质量门禁（硬检查+LLM复审）
 │   │   └── utils/             # 状态定义、工具函数
+│   │       ├── agent_utils.py           # 工具聚合导入
+│   │       ├── analysis_tools.py        # K线形态识别 @tool（12种形态）
+│   │       ├── financial_rigor.py       # 精确十进制计算 @tool（PE/PB/ROE验算）
+│   │       ├── playwright_tools.py      # playwright_service 工具入口
+│   │       ├── signal_data_tools.py     # 信号数据 @tool（含筹码/涨停池）
+│   │       └── ...
 │   ├── dataflows/
-│   │   ├── a_stock.py         # A 股数据 vendor（直连 HTTP API，零第三方库）
-│   │   ├── interface.py       # 数据接口抽象层
+│   │   ├── a_stock.py         # A 股数据 vendor（直连 HTTP，含CYQ筹码算法）
+│   │   ├── interface.py       # VENDOR_METHODS 路由表（19个方法）
 │   │   └── ...
 │   └── graph/
-│       ├── trading_graph.py   # 主入口：TradingAgentsGraph
+│       ├── trading_graph.py   # 主入口：TradingAgentsGraph + ToolNode 注册
 │       ├── setup.py           # LangGraph 拓扑定义
 │       ├── propagation.py     # 状态初始化与传播
-│       ├── reflection.py      # 交易反思（CSI 300 基准）
+│       ├── quality_gate.py    # 质量门禁节点
+│       ├── reflection.py      # 交易反思（东财push2his收益，非yfinance）
 │       └── conditional_logic.py
+├── playwright_service/         # 独立 HTTP 数据服务（worktrade2 环境）
+│   ├── server.py              # 16端点 API + Chrome CDP 抓取
+│   ├── client.py              # HTTP 客户端 + 熔断器（threading.Lock 线程安全）
+│   └── README.md
 ├── web/
 │   ├── app.py                 # Streamlit 主入口
 │   ├── runner.py              # 后台线程运行分析
-│   ├── progress.py            # 线程安全进度追踪
-│   ├── history.py             # 历史记录扫描
-│   ├── pdf_export.py          # PDF 报告生成
-│   ├── launch.py              # CLI 启动器
-│   └── components/            # UI 组件
-│       ├── sidebar.py         # 侧边栏（输入 + 历史）
-│       ├── progress_panel.py  # 实时进度面板
-│       └── report_viewer.py   # 报告展示
-├── test_astock.py             # E2E 集成测试
+│   └── ...
+├── tests/                     # 180 项单元测试
 ├── CHANGES_FROM_UPSTREAM.md   # 与上游的完整改动记录
 ├── NOTICE                     # Apache 2.0 归属声明
 ├── LICENSE                    # Apache 2.0 许可证

@@ -11,8 +11,16 @@ worktrade3环境(主程序)                    worktrade2环境(playwright服务
 │ TradingAgents主程序  │  HTTP :8765     │ playwright_service/   │
 │  playwright_tools.py │ ──────────────> │  server.py            │
 │  -> PlaywrightClient │  JSON响应       │  (playwright + CDP)   │
+│  (熔断器+Lock保护)   │                 │  (每请求独立page)     │
 └─────────────────────┘                 └──────────────────────┘
 ```
+
+## 安全机制
+
+- **熔断器**（`client.py`）：5次连续失败后熔断60秒，`threading.Lock` 线程安全
+- **独立 page**（`server.py`）：每个请求 `ctx.new_page()` + `finally page.close()`，并发请求数据不串台
+- **参数校验**（`server.py`）：`code` 参数正则校验 `^\d{6}$`
+- **SSE 流容错**（`server.py`）：`_parse_sse_lines` 辅助函数，单行畸形 JSON 跳过不影响整体
 
 ## 安装
 
