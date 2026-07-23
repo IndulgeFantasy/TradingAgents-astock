@@ -82,3 +82,35 @@ def test_incomplete_task_writes_are_thread_safe(tmp_path, monkeypatch):
     assert len(entries) == 10
     assert {entry["status"] for entry in entries} == {"running"}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_extract_signal_chinese_final_decision():
+    """Chinese free-text decision must yield the real rating, not Hold/N/A.
+
+    Regression for issues #78 / #80: history reload used an English-only
+    BUY/SELL/HOLD scan that missed Chinese output entirely.
+    """
+    state = {
+        "final_trade_decision": "最终评级：卖出\n核心结论：风险尚未出清。",
+        "investment_plan": "研究经理倾向持有观望。",
+    }
+    assert history.extract_signal(state) == "Sell"
+
+
+def test_extract_signal_prefers_final_trade_decision():
+    """The reload signal must match the authoritative live signal source."""
+    state = {
+        "investment_plan": "最终评级：买入",
+        "final_trade_decision": "最终评级：减持",
+    }
+    assert history.extract_signal(state) == "Underweight"
+
+
+def test_extract_signal_english_still_works():
+    state = {"final_trade_decision": "**Rating**: Buy\n\nThesis."}
+    assert history.extract_signal(state) == "Buy"
+
+
+def test_extract_signal_unknown_returns_na():
+    assert history.extract_signal({"final_trade_decision": "无明确方向。"}) == "N/A"
+    assert history.extract_signal({}) == "N/A"

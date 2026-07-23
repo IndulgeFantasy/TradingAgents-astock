@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [0.2.19] — 2026-07-23
+
+TRADING SIGNAL 恒为 HOLD 的真 bug 修复（#78 / #80）。无破坏性变更、无新依赖。
+
+### 修复
+- **中文输出时 TRADING SIGNAL 恒为 HOLD，与最终评级不一致（#78 / #80）**：信号提取器 `parse_rating`（`tradingagents/agents/utils/rating.py`）此前只识别英文五档词（Buy/Overweight/Hold/Underweight/Sell）。当 `output_language` 设为中文、且模型（DeepSeek/MiniMax/Qwen 或 OpenAI 兼容中继等）的结构化输出**回退到自由文本**时（见 `agents/utils/structured.py` 的 `invoke_structured_or_freetext`），最终决策是**中文散文**（如「最终评级：卖出」），没有英文 `Rating:` 头 → `parse_rating` 一个词都匹配不到 → **静默返回默认值 Hold**。即使研究经理明确给出「卖出/增持」，顶部 TRADING SIGNAL 也永远显示 HOLD。
+  - `parse_rating` 现同时识别中文五档词（买入/增持/持有(中性)/减持/卖出，含强烈买入/清仓等变体）与中文标签（最终评级/评级/投资建议/推荐评级 等 + `：` + 评级）。四段解析：英文标签 → 中文标签 → 英文裸词 → 中文裸词，显式标签优先于裸词，最长匹配优先（强烈买入 胜过 买入）。英文路径行为不变。
+  - **一并修 `web/history.py` 的 `extract_signal`**（历史重载展示走的第二个提取器）：原本也是英文 `BUY/SELL/HOLD` 裸扫、仅三档、默认 N/A，对中文同样失效。改为委托 `parse_rating`，并优先读 `final_trade_decision`，使历史重载信号与实时 `process_signal` 一致。
+  - CLI（`cli/main.py`）、Web 实时展示、Web 历史重载、以及 memory 日志的评级标签（`agents/utils/memory.py` 同走 `parse_rating`）四处同时修复——`parse_rating` 是唯一咽喉。
+
+### 测试
+- `tests/test_signal_processing.py` 新增 `TestParseRatingChinese`（含 #78 原样决策文本 → Sell、五档中文标签、强烈/清仓变体、「标签压过散文里的减持」、中文裸词兜底、中英混排英文标签仍优先）。
+- `tests/test_web_history.py` 新增 4 项 `extract_signal` 回归（中文最终决策→真实评级、优先 final_trade_decision、英文仍可用、无法识别→N/A）。
+- 独立验证（py3.12）：`parse_rating` 16/16、`extract_signal` 6/6 全通过，含 #78 原样场景；改动文件 py_compile 全过。
+
 ## [0.2.18] — 2026-07-10
 
 合并社区 PR #75（致谢 @wangyuxun6699），与 v0.2.17 的 #76 修复同属一类问题：LLM 工具调用把非股票标识当 `ticker` 传入。

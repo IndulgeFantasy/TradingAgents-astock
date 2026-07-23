@@ -62,6 +62,65 @@ class TestParseRating:
             assert parse_rating(f"Rating: {r}") == r
 
 
+@pytest.mark.unit
+class TestParseRatingChinese:
+    """Chinese free-text path (issues #78 / #80).
+
+    When output_language is Chinese and structured output falls back to
+    free-text, the decision has no English ``Rating:`` header — only a
+    Chinese label like ``最终评级：卖出``. These previously all defaulted
+    to Hold.
+    """
+
+    def test_issue_78_exact_shape(self):
+        # The exact decision shape from issue #78 that displayed HOLD.
+        text = (
+            "👔 最终投资建议\n"
+            "研究经理：辩论复盘与最终投资计划书\n"
+            "标的：贵州茅台\n"
+            "辩论回合：牛熊充分交锋\n"
+            "最终评级：卖出\n"
+            "核心结论：熊方以详实的数据彻底拆解了牛方的黄金坑幻想。"
+        )
+        assert parse_rating(text) == "Sell"
+
+    def test_cn_label_each_tier(self):
+        cases = {
+            "买入": "Buy", "增持": "Overweight", "持有": "Hold",
+            "减持": "Underweight", "卖出": "Sell", "中性": "Hold",
+        }
+        for cn, en in cases.items():
+            assert parse_rating(f"最终评级：{cn}\n理由若干。") == en
+
+    def test_cn_label_variants(self):
+        assert parse_rating("投资建议: **增持**\n分批建仓。") == "Overweight"
+        assert parse_rating("评级：清仓") == "Sell"
+        assert parse_rating("推荐评级 - 强烈买入") == "Buy"
+
+    def test_cn_strong_beats_plain(self):
+        # 强烈买入 must not be read as the shorter 买入 mapping (same tier here,
+        # but the longest-match rule matters for correct term identification).
+        assert parse_rating("最终评级：强烈卖出") == "Sell"
+
+    def test_cn_label_wins_over_prose_term(self):
+        # Prose mentions 大股东减持 (Underweight term) but the labelled rating
+        # is 买入 — the label must win.
+        text = (
+            "分析：需警惕大股东减持压力与解禁风险。\n"
+            "最终评级：买入\n"
+            "综合判断上行空间显著。"
+        )
+        assert parse_rating(text) == "Buy"
+
+    def test_cn_bare_term_last_resort(self):
+        # No label at all, only a bare Chinese conclusion — better than Hold.
+        assert parse_rating("综合来看应当卖出该标的。") == "Sell"
+
+    def test_english_label_still_wins_in_mixed_text(self):
+        # English structured render must be unaffected by the Chinese additions.
+        assert parse_rating("**Rating**: Buy\n\n**投资论点**：AI 资本开支周期完好。") == "Buy"
+
+
 # ---------------------------------------------------------------------------
 # SignalProcessor: thin adapter over the heuristic
 # ---------------------------------------------------------------------------
