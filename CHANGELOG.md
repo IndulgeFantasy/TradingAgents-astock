@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [0.2.21] — 2026-07-23
+
+新增可配置的技术分析回溯窗口 / 按月分析（#16）。无破坏性变更、无新依赖。
+
+### 新增
+- **自定义数据起始日期 / 按月分析（#16）**：此前技术分析的回溯天数由模型自行决定（工具默认 ~30 天），用户无法控制分析区间。现在：
+  - **Web 侧栏新增「数据起始日期」**（默认本月第一天）——分析区间 = 起始日期 → 分析日期，用于「按月」或自定义时段分析。
+  - **CLI 新增 Step 2b「Data Start Date」**——交互式输入起始日期（默认分析月首日）。
+  - 两端都据「起始日期 → 分析日期」算出 `market_lookback_days`（下限 5 天），写入 config。
+  - **market_analyst 读取并注入 prompt**：显式要求调用 `get_stock_data` / `get_indicators` 时 `look_back_days` 传该值，「必采清单」的「近 N 日累计涨跌幅」也随之联动。
+  - 新增 config 键 `market_lookback_days`（`default_config.py`，默认 `None` = 保持原行为，模型自选 ~30）。
+  - 感谢 @hejingchi 定位到 `get_indicators` 的 `look_back_days` 参数并提交 PR #18 的相关思路（本实现单独干净落地，未夹带 PR #18 的字体/主题改动）。
+
+### 测试
+- 新增 `tests/test_market_lookback.py`：`DEFAULT_CONFIG` 含键且默认 None、config 读取逻辑（配置 15 → 15 / None → 默认 30）、天数派生 clamp（本月首日→今日=22、起始≥分析→5、跨月=60）。
+- 独立验证（py3.12）：config set/get 流 + 派生逻辑 7 条断言全过；5 改动文件 + 测试文件 py_compile 全过；market_analyst f-string 注入渲染正确（无杂散括号）。
+
+## [0.2.20] — 2026-07-23
+
+新增通用「OpenAI 兼容（自定义 base_url）」provider，接任意 OpenAI 兼容网关（#77 / #81）。无破坏性变更、无新依赖。
+
+### 新增
+- **`openai_compatible` 通用 provider（#77 / #81）**：面向任意讲 OpenAI Chat Completions 协议的中继 / 网关（9Router、AI Router、自建代理）——用户自填 `base_url` + `model` + 通用 Key，无厂商写死默认值。此前只能通过"借用 OpenRouter 档 + 覆盖 backend_url"这种不直观的方式实现，现在是一等公民。
+  - `llm_clients/factory.py`：`openai_compatible` 加入 OpenAI 兼容路由。
+  - `llm_clients/openai_client.py`：新分支——`base_url` 必填（缺失给明确报错），Key 从 `OPENAI_COMPATIBLE_API_KEY` 读取（回退 `OPENAI_API_KEY`），走标准 Chat Completions（**非** OpenAI Responses API，兼容性最好），model 名自由填。
+  - `llm_clients/validators.py`：`openai_compatible` 与 ollama/openrouter 一样接受任意 model 名、不告警。
+  - **Web UI**（`web/components/sidebar.py`）：供应商下拉新增「OpenAI 兼容（自定义 base_url·9Router/AI Router/自建代理）」，自动走自定义 model ID 输入 + Base URL 必填提示。
+  - **CLI**（`cli/utils.py`）：Provider 列表新增 `OpenAI-Compatible`，选中后交互式提示输入 Base URL，模型 ID 手动填写。
+  - README 新增 `.env` 方案 H + FAQ「如何接第三方 OpenAI 兼容网关」+ 供应商计数更新。
+
+### 测试
+- 新增 `tests/test_openai_compatible_provider.py`：factory 路由、`base_url` 缺失报错、Key 缺失报错、`OPENAI_COMPATIBLE_API_KEY` 优先与 `OPENAI_API_KEY` 回退、自定义 model 不告警。
+- `tests/test_model_validation.py` 的自定义 model 免告警用例扩展含 `openai_compatible`。
+- 独立验证（py3.12）：validators 免告警、factory 路由、`get_llm` 的 base_url 必填 + Key 解析分支逻辑全通过；5 改动文件 + 2 测试文件 py_compile 全过。
+
+## [0.2.19] — 2026-07-23
+
+TRADING SIGNAL 恒为 HOLD 的真 bug 修复（#78 / #80）。无破坏性变更、无新依赖。
+
+### 修复
+- **中文输出时 TRADING SIGNAL 恒为 HOLD，与最终评级不一致（#78 / #80）**：信号提取器 `parse_rating`（`tradingagents/agents/utils/rating.py`）此前只识别英文五档词（Buy/Overweight/Hold/Underweight/Sell）。当 `output_language` 设为中文、且模型（DeepSeek/MiniMax/Qwen 或 OpenAI 兼容中继等）的结构化输出**回退到自由文本**时（见 `agents/utils/structured.py` 的 `invoke_structured_or_freetext`），最终决策是**中文散文**（如「最终评级：卖出」），没有英文 `Rating:` 头 → `parse_rating` 一个词都匹配不到 → **静默返回默认值 Hold**。即使研究经理明确给出「卖出/增持」，顶部 TRADING SIGNAL 也永远显示 HOLD。
+  - `parse_rating` 现同时识别中文五档词（买入/增持/持有(中性)/减持/卖出，含强烈买入/清仓等变体）与中文标签（最终评级/评级/投资建议/推荐评级 等 + `：` + 评级）。四段解析：英文标签 → 中文标签 → 英文裸词 → 中文裸词，显式标签优先于裸词，最长匹配优先（强烈买入 胜过 买入）。英文路径行为不变。
+  - **一并修 `web/history.py` 的 `extract_signal`**（历史重载展示走的第二个提取器）：原本也是英文 `BUY/SELL/HOLD` 裸扫、仅三档、默认 N/A，对中文同样失效。改为委托 `parse_rating`，并优先读 `final_trade_decision`，使历史重载信号与实时 `process_signal` 一致。
+  - CLI（`cli/main.py`）、Web 实时展示、Web 历史重载、以及 memory 日志的评级标签（`agents/utils/memory.py` 同走 `parse_rating`）四处同时修复——`parse_rating` 是唯一咽喉。
+
+### 测试
+- `tests/test_signal_processing.py` 新增 `TestParseRatingChinese`（含 #78 原样决策文本 → Sell、五档中文标签、强烈/清仓变体、「标签压过散文里的减持」、中文裸词兜底、中英混排英文标签仍优先）。
+- `tests/test_web_history.py` 新增 4 项 `extract_signal` 回归（中文最终决策→真实评级、优先 final_trade_decision、英文仍可用、无法识别→N/A）。
+- 独立验证（py3.12）：`parse_rating` 16/16、`extract_signal` 6/6 全通过，含 #78 原样场景；改动文件 py_compile 全过。
+
 ## [0.2.18] — 2026-07-10
 
 合并社区 PR #75（致谢 @wangyuxun6699），与 v0.2.17 的 #76 修复同属一类问题：LLM 工具调用把非股票标识当 `ticker` 传入。
