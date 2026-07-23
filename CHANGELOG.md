@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [0.2.20] — 2026-07-23
+
+新增通用「OpenAI 兼容（自定义 base_url）」provider，接任意 OpenAI 兼容网关（#77 / #81）。无破坏性变更、无新依赖。
+
+### 新增
+- **`openai_compatible` 通用 provider（#77 / #81）**：面向任意讲 OpenAI Chat Completions 协议的中继 / 网关（9Router、AI Router、自建代理）——用户自填 `base_url` + `model` + 通用 Key，无厂商写死默认值。此前只能通过"借用 OpenRouter 档 + 覆盖 backend_url"这种不直观的方式实现，现在是一等公民。
+  - `llm_clients/factory.py`：`openai_compatible` 加入 OpenAI 兼容路由。
+  - `llm_clients/openai_client.py`：新分支——`base_url` 必填（缺失给明确报错），Key 从 `OPENAI_COMPATIBLE_API_KEY` 读取（回退 `OPENAI_API_KEY`），走标准 Chat Completions（**非** OpenAI Responses API，兼容性最好），model 名自由填。
+  - `llm_clients/validators.py`：`openai_compatible` 与 ollama/openrouter 一样接受任意 model 名、不告警。
+  - **Web UI**（`web/components/sidebar.py`）：供应商下拉新增「OpenAI 兼容（自定义 base_url·9Router/AI Router/自建代理）」，自动走自定义 model ID 输入 + Base URL 必填提示。
+  - **CLI**（`cli/utils.py`）：Provider 列表新增 `OpenAI-Compatible`，选中后交互式提示输入 Base URL，模型 ID 手动填写。
+  - README 新增 `.env` 方案 H + FAQ「如何接第三方 OpenAI 兼容网关」+ 供应商计数更新。
+
+### 测试
+- 新增 `tests/test_openai_compatible_provider.py`：factory 路由、`base_url` 缺失报错、Key 缺失报错、`OPENAI_COMPATIBLE_API_KEY` 优先与 `OPENAI_API_KEY` 回退、自定义 model 不告警。
+- `tests/test_model_validation.py` 的自定义 model 免告警用例扩展含 `openai_compatible`。
+- 独立验证（py3.12）：validators 免告警、factory 路由、`get_llm` 的 base_url 必填 + Key 解析分支逻辑全通过；5 改动文件 + 2 测试文件 py_compile 全过。
+
 ## [0.2.19] — 2026-07-23
 
 TRADING SIGNAL 恒为 HOLD 的真 bug 修复（#78 / #80）。无破坏性变更、无新依赖。

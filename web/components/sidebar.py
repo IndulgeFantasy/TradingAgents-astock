@@ -27,6 +27,7 @@ _PROVIDERS: list[tuple[str, str]] = [
     ("Google Gemini", "google"),
     ("xAI Grok", "xai"),
     ("OpenRouter（聚合·填 vendor/model 形式 ID）", "openrouter"),
+    ("OpenAI 兼容（自定义 base_url·9Router/AI Router/自建代理）", "openai_compatible"),
     ("Ollama（本地）", "ollama"),
 ]
 
@@ -175,20 +176,26 @@ def _render_llm_config() -> None:
         st.session_state["quick_think_llm"] = custom_quick
         st.session_state["deep_think_llm"] = custom_deep
 
+    base_url_required = provider_key == "openai_compatible"
     st.text_input(
-        "API Base URL（第三方/代理，可选）",
+        "API Base URL（第三方/代理" + ("·必填" if base_url_required else "，可选") + "）",
         key="llm_base_url",
-        placeholder="例: https://your-proxy.com/v1",
+        placeholder="例: https://your-relay.example/v1",
         help=(
-            "通过第三方中转/代理访问 Claude、OpenAI 等模型时填写网关地址；"
-            "留空则用所选供应商的官方地址。API Key 仍从 .env 读取，"
-            "且每个供应商用各自的环境变量——"
+            "通过第三方中转/代理访问模型时填写网关地址；留空则用所选供应商的官方地址。"
+            "API Key 仍从 .env 读取，每个供应商用各自的环境变量——"
             "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、"
             "通义=DASHSCOPE_API_KEY、智谱=ZHIPU_API_KEY、MiniMax=MINIMAX_API_KEY、"
-            "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY。"
+            "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY、"
+            "OpenAI 兼容（自定义）=OPENAI_COMPATIBLE_API_KEY（也接受 OPENAI_API_KEY）。"
             "也可在 .env 里设 BACKEND_URL 代替此处。"
         ),
     )
+    if base_url_required:
+        st.caption(
+            "已选「OpenAI 兼容（自定义）」：**Base URL 必填**（你的网关，走标准 Chat "
+            "Completions），模型 ID 手动填写，Key 在 .env 设 `OPENAI_COMPATIBLE_API_KEY`。"
+        )
 
 
 def render_sidebar() -> None:

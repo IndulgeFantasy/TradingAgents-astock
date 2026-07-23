@@ -189,6 +189,10 @@ ANTHROPIC_API_KEY=sk-ant-xxx
 
 # ── 方案 G：Kimi（Anthropic 兼容 API）────────────────
 ANTHROPIC_AUTH_TOKEN=your-kimi-token
+
+# ── 方案 H：任意 OpenAI 兼容网关（9Router / AI Router / 自建代理）──
+OPENAI_COMPATIBLE_API_KEY=sk-xxx     # 也接受 OPENAI_API_KEY
+BACKEND_URL=https://your-relay.example/v1   # 你的网关地址（也可在 Web 侧栏「API Base URL」填）
 ```
 
 ### 3. 运行分析
@@ -255,7 +259,7 @@ streamlit run web/app.py
 
 ### 功能
 
-- **模型自选**：侧边栏支持 9 个 LLM 供应商切换（MiniMax/DeepSeek/Qwen/GLM/OpenAI/Anthropic/Google/xAI/Ollama）
+- **模型自选**：侧边栏支持 10 个 LLM 供应商切换（MiniMax/DeepSeek/Qwen/GLM/OpenAI/Anthropic/Google/xAI/OpenRouter/Ollama），外加 **「OpenAI 兼容（自定义 base_url）」** 一档可接任意 OpenAI 兼容网关（9Router / AI Router / 自建代理）
 - **一键分析**：输入 6 位 A 股代码 + 日期，点击「开始分析」
 - **实时进度**：12 阶段 pipeline 实时显示（7 分析师 → 质量门控 → 辩论 → 风控 → 决策），所有已完成阶段的报告均可展开查看
 - **完整报告**：信号卡片（Buy/Hold/Sell）、7 份分析师报告、多空辩论、风控评估
@@ -292,7 +296,10 @@ streamlit run web/app.py
 ## 常见问题排错
 
 **Q: 用 DeepSeek/通义/智谱，却报 `OpenAIError: The api_key client option must be set ... OPENAI_API_KEY`？**
-每个供应商用**各自的环境变量**，不是 OPENAI_API_KEY：DeepSeek=`DEEPSEEK_API_KEY`、通义=`DASHSCOPE_API_KEY`、智谱=`ZHIPU_API_KEY`、MiniMax=`MINIMAX_API_KEY`、xAI=`XAI_API_KEY`、OpenRouter=`OPENROUTER_API_KEY`。在项目根目录 `.env` 里设置对应变量后**重启**程序。（v0.2.12 起缺 key 会直接提示该用哪个变量名。）
+每个供应商用**各自的环境变量**，不是 OPENAI_API_KEY：DeepSeek=`DEEPSEEK_API_KEY`、通义=`DASHSCOPE_API_KEY`、智谱=`ZHIPU_API_KEY`、MiniMax=`MINIMAX_API_KEY`、xAI=`XAI_API_KEY`、OpenRouter=`OPENROUTER_API_KEY`、OpenAI 兼容（自定义）=`OPENAI_COMPATIBLE_API_KEY`。在项目根目录 `.env` 里设置对应变量后**重启**程序。（v0.2.12 起缺 key 会直接提示该用哪个变量名。）
+
+**Q: 想接一个 OpenAI 兼容的第三方网关/中继（9Router、AI Router、自建代理），自定义 base_url + model？**
+用 **「OpenAI 兼容（自定义 base_url）」** 这一档（v0.2.20 新增）。Web 侧栏「LLM 供应商」选它 →「快速/深度思考模型 ID」手动填你网关支持的 model 名 →「API Base URL」填你的网关地址（如 `https://your-relay.example/v1`）→ `.env` 里设 `OPENAI_COMPATIBLE_API_KEY=你的key`（也接受 `OPENAI_API_KEY`）。CLI 方式选 `OpenAI-Compatible` 后会提示输入 Base URL。它走标准 Chat Completions（非 OpenAI Responses API，兼容性最好），model 名自由填、不受内置清单限制。配置方式等价：`llm_provider="openai_compatible"` + `backend_url="<你的网关>"` + `deep_think_llm/quick_think_llm="<你的model>"`。
 
 **Q: 导出 PDF 报 `UnicodeEncodeError: 'latin-1' codec can't encode`？**
 你的环境里装了**旧版 `fpdf`（pyfpdf）**，它和本项目用的 `fpdf2` 都以 `fpdf` 名称导入、互相冲突。执行：`pip uninstall -y fpdf && pip install "fpdf2>=2.8.6"`。实在不行可改用「下载 Markdown」导出（零依赖，永远可用）。
