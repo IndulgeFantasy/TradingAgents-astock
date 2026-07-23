@@ -146,10 +146,35 @@ class OpenAIClient(BaseLLMClient):
         self.warn_if_unknown_model()
         llm_kwargs = {"model": self.model}
 
+        # Generic OpenAI-compatible relay (#77 / #81): the user supplies the
+        # base_url and model themselves, and the API key comes from a generic
+        # env var. No vendor defaults — this is the escape hatch for any
+        # gateway (9Router, AI Router, self-hosted proxy) that speaks the
+        # OpenAI Chat Completions API.
+        if self.provider == "openai_compatible":
+            if not self.base_url:
+                raise RuntimeError(
+                    "openai_compatible 需要填写 base_url。请在 Web 侧栏「API Base URL」"
+                    "或配置 `backend_url` 里填写你的 OpenAI 兼容网关地址"
+                    "（例如 https://your-relay.example/v1）。"
+                )
+            llm_kwargs["base_url"] = self.base_url
+            api_key = (
+                os.environ.get("OPENAI_COMPATIBLE_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+            )
+            if api_key:
+                llm_kwargs["api_key"] = api_key
+            elif "api_key" not in self.kwargs:
+                raise RuntimeError(
+                    "未找到 openai_compatible 的 API Key。请在 .env 文件或环境变量中设置 "
+                    "`OPENAI_COMPATIBLE_API_KEY=你的key`（也接受 `OPENAI_API_KEY`），"
+                    "设置后重启程序。"
+                )
         # Provider-specific base URL and auth. An explicit base_url on the
         # client (e.g. a corporate proxy) takes precedence over the
         # provider default so users can route through their own gateway.
-        if self.provider in _PROVIDER_CONFIG:
+        elif self.provider in _PROVIDER_CONFIG:
             default_base, api_key_env = _PROVIDER_CONFIG[self.provider]
             llm_kwargs["base_url"] = self.base_url or default_base
             if api_key_env:

@@ -28,6 +28,7 @@ _PROVIDERS: list[tuple[str, str]] = [
     ("Google Gemini", "google"),
     ("xAI Grok", "xai"),
     ("OpenRouter（聚合·填 vendor/model 形式 ID）", "openrouter"),
+    ("OpenAI 兼容（自定义 base_url·9Router/AI Router/自建代理）", "openai_compatible"),
     ("Ollama（本地）", "ollama"),
 ]
 
@@ -179,21 +180,26 @@ def _render_llm_config() -> None:
         st.session_state["quick_think_llm"] = custom_quick
         st.session_state["deep_think_llm"] = custom_deep
 
+    base_url_required = provider_key == "openai_compatible"
     st.text_input(
-        "API Base URL（第三方/代理，可选）",
+        "API Base URL（第三方/代理" + ("·必填" if base_url_required else "，可选") + "）",
         key="llm_base_url",
-        placeholder="例: https://your-proxy.com/v1",
+        placeholder="例: https://your-relay.example/v1",
         help=(
-            "Through third-party proxy / gateway to access Claude, OpenAI, etc; "
-            "leave empty to use the provider default URL. API Key is read from .env, "
-            "each provider uses its own env var: "
-            "OpenAI=OPENAI_API_KEY, DeepSeek=DEEPSEEK_API_KEY, "
-            "Qwen=DASHSCOPE_API_KEY, GLM=ZHIPU_API_KEY, MiniMax=MINIMAX_API_KEY, "
-            "Claude=ANTHROPIC_API_KEY, OpenRouter=OPENROUTER_API_KEY, xAI=XAI_API_KEY, "
-            "Volcengine=VOLCENGINE_API_KEY. "
-            "You can also set BACKEND_URL in .env instead."
+            "通过第三方中转/代理访问模型时填写网关地址；留空则用所选供应商的官方地址。"
+            "API Key 仍从 .env 读取，每个供应商用各自的环境变量——"
+            "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、"
+            "通义=DASHSCOPE_API_KEY、智谱=ZHIPU_API_KEY、MiniMax=MINIMAX_API_KEY、"
+            "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY、"
+            "OpenAI 兼容（自定义）=OPENAI_COMPATIBLE_API_KEY（也接受 OPENAI_API_KEY）。"
+            "也可在 .env 里设 BACKEND_URL 代替此处。"
         ),
     )
+    if base_url_required:
+        st.caption(
+            "已选「OpenAI 兼容（自定义）」：**Base URL 必填**（你的网关，走标准 Chat "
+            "Completions），模型 ID 手动填写，Key 在 .env 设 `OPENAI_COMPATIBLE_API_KEY`。"
+        )
 
 
 def render_sidebar() -> None:
@@ -229,6 +235,18 @@ def render_sidebar() -> None:
         value=date.today(),
         key="input_date",
     )
+
+    start_date = st.date_input(
+        "数据起始日期",
+        value=trade_date.replace(day=1),   # 默认本月第一天
+        key="input_start_date",
+        help="技术分析回溯到该日期（默认本月第一天）。分析区间 = 起始日期 → 分析日期，"
+             "用于「按月」或自定义时段分析；留默认即分析当月至今。",
+    )
+    # 分析窗口天数 → market_lookback_days（下限 5 天，保证指标有意义）
+    st.session_state["market_lookback_days"] = max((trade_date - start_date).days, 5)
+    if start_date >= trade_date:
+        st.caption("⚠️ 起始日期应早于分析日期，已按最小窗口（5 天）处理。")
 
     with st.expander("⚙️ 模型配置", expanded=False):
         _render_llm_config()

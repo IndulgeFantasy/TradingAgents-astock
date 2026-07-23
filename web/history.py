@@ -185,19 +185,30 @@ def load_analysis(path: str) -> dict[str, Any]:
 
 
 def extract_signal(state: dict[str, Any]) -> str:
-    """Extract the short signal (Buy/Sell/Hold) from a final state dict."""
+    """Extract the 5-tier rating from a final state dict for history reload.
+
+    Delegates to the shared ``parse_rating`` heuristic so the history-reload
+    display matches the live signal (``TradingAgentsGraph.process_signal``) and
+    understands Chinese free-text decisions — not just English keywords. The
+    old English-only ``BUY/SELL/HOLD`` scan silently returned Hold/N/A for
+    every Chinese-output run (issues #78 / #80). ``final_trade_decision`` is
+    checked first so the reload matches the authoritative live signal.
+    """
     import re
 
+    from tradingagents.agents.utils.rating import parse_rating
+
+    _UNKNOWN = ""
     for field in (
-        "investment_plan",
-        "trader_investment_decision",
         "final_trade_decision",
+        "trader_investment_decision",
+        "investment_plan",
     ):
         text = state.get(field, "")
         if not text:
             continue
         cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-        for keyword in ("BUY", "SELL", "HOLD"):
-            if keyword in cleaned.upper():
-                return keyword.capitalize()
+        rating = parse_rating(cleaned, default=_UNKNOWN)
+        if rating:
+            return rating
     return "N/A"
