@@ -1,6 +1,9 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from tradingagents.agents.utils.agent_utils import build_instrument_context, get_fund_flow, get_language_instruction, get_market_context, get_news
+from tradingagents.agents.utils.agent_utils import build_instrument_context, get_fund_flow, get_language_instruction, get_market_context, get_news, retry_report_generation
 from tradingagents.dataflows.config import get_config
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_social_media_analyst(llm):
@@ -22,7 +25,7 @@ def create_social_media_analyst(llm):
             "\n- **情绪指标**：关注以下情绪信号 - 连续涨停后的追涨情绪、业绩暴雷后的恐慌抛售、机构调研后的预期变化、热门概念炒作的跟风程度。"
             "\n- **反向指标**：当市场情绪一致性过高（极度乐观或极度悲观）时，往往是反转信号。散户一致看多可能是阶段顶部。"
             "\n- **时间维度**：区分短期情绪波动（1-3 天，由单一事件驱动）和中期情绪趋势（1-4 周，由基本面变化驱动）。"
-            "\n- **大盘情绪传导**：调用 get_market_context() 查看当前大盘整体走势（上证指数/沪深300），大盘的乐观或悲观情绪会传导至个股层面。大盘系统性风险上升时，个股的负面情绪会被放大。"
+            "\n- **大盘情绪传导**：调用 get_market_context() 查看当前大盘整体走势（上证指数/沪深300/深证成指/创业板指/科创50/中证500/国证2000），大盘的乐观或悲观情绪会传导至个股层面。大盘系统性风险上升时，个股的负面情绪会被放大。"
             "\n\n请使用以下工具获取数据："
             "\n- `get_news(ticker, start_date, end_date)`：获取公司相关新闻和市场讨论，ticker 必须使用目标股票的 6 位代码。从新闻内容中推断市场情绪方向、强度和可能的转折点。"
             "\n- `get_fund_flow(ticker, curr_date)`：获取散户情绪指标（DDE散户数量变化，正=散户增加，负=散户减少）和主力资金流向。DDE散户数量是重要的反向情绪指标--散户集体看多时往往是阶段顶部，散户恐慌出逃时可能是反弹机会。"
@@ -66,7 +69,17 @@ def create_social_media_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = result.content if result.content else ""
+            if not report.strip():
+                report = retry_report_generation(
+                    llm, state["messages"], result, "social_media_analyst"
+                )
+        else:
+            # LLM may return both tool_calls and content simultaneously.
+            # Keep the content as a candidate report so it's not lost.
+            report = result.content if result.content else ""
+            tool_names = [tc.get("name", "?") for tc in result.tool_calls]
+            logger.info("social_media_analyst: tool_calls=%s", tool_names)
 
         return {
             "messages": [result],

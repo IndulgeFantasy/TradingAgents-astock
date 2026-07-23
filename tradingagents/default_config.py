@@ -47,5 +47,7 @@ DEFAULT_CONFIG = {
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
+        "get_fund_flow": "playwright",  # 问财版含 DDE 散户数量趋势
+        "get_profit_forecast": "playwright",  # 同花顺F10详细版（轻量直连HTTP易被反爬）
     },
 }

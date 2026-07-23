@@ -8,13 +8,15 @@ def get_profit_forecast(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
     """
-    Retrieve consensus EPS forecasts with forward valuation metrics.
-    Returns analyst coverage count, EPS range, forward PE, PEG, and PE digestion time.
-    Uses the configured signal_data vendor.
+    Retrieve consensus EPS forecasts and analyst ratings from 同花顺F10.
+    Returns: EPS/净利润一致预期(含调高调低标记), 机构预测明细,
+    详细指标预测(营收/净利/ROE/PE等12指标×6年), Forward PE/PEG/PE消化时间,
+    机构评级分布(买入/增持/中性/减持/卖出), 逐条研报评级(机构+评级+标题+日期),
+    机构观点摘要.
     Args:
         ticker (str): A-stock code
     Returns:
-        str: Consensus forecast report with valuation metrics
+        str: Consensus forecast report with valuation metrics and analyst ratings
     """
     return route_to_vendor("get_profit_forecast", ticker)
 

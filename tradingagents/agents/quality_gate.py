@@ -74,8 +74,10 @@ def _build_review_prompt(
         content = reports.get(field, "（未运行）")
         if not content:
             content = "（报告为空）"
-        if len(content) > 3000:
-            content = content[:3000] + "\n... (truncated for review)"
+        if len(content) > 15000:
+            head = content[:9000]
+            tail = content[-5000:]
+            content = f"{head}\n\n...[中略 {len(content) - 14000} 字符]...\n\n{tail}"
         report_sections.append(f"### {name} ({analyst_type})\n{content}")
 
     all_reports = "\n\n".join(report_sections)
@@ -94,7 +96,7 @@ def _build_review_prompt(
 
 | 分析师 | 评级 | 数据时效 | 缺失项 | 备注 |
 |--------|------|----------|--------|------|
-| 技术分析师 | A/B/C/D/F | 是否匹配交易日 | 列出缺失的必采项 | 简要说明 |
+| 技术分析师 | A/B/C/D/F | 是否匹配交易日 | 逐项列出具体缺失数据（如"筹码分布"、"MACD"、"龙虎榜席位"），无缺失填"无" | 简要说明 |
 | 情绪分析师 | ... | ... | ... | ... |
 | 新闻分析师 | ... | ... | ... | ... |
 | 基本面分析师 | ... | ... | ... | ... |
@@ -102,9 +104,11 @@ def _build_review_prompt(
 | 游资追踪师 | ... | ... | ... | ... |
 | 解禁监控师 | ... | ... | ... | ... |
 
+**缺失项要求**：必须具体到数据点名称，禁止写"部分数据缺失"、"若干项"等模糊描述。若报告中有 `[数据缺失: xxx]` 标注，直接引用 xxx；若报告未提但必采清单要求的项也要列出。
+
 **整体评级**: A/B/C/D/F
 **数据可信度**: 高/中/低
-**建议**: （如有数据缺失，提醒辩论阶段谨慎使用该报告）
+**建议**: （如有数据缺失，提醒辩论阶段谨慎使用该报告，并指出哪些具体数据缺失影响哪类判断）
 
 评级标准：
 - A: 必采清单全部覆盖，数据时效匹配，有汇总表格

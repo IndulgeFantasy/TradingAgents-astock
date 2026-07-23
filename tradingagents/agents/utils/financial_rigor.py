@@ -347,7 +347,7 @@ def verify_stock_valuation(
     code: Annotated[str, "A-stock code (e.g. 600519)"],
 ) -> str:
     """验算个股估值指标（PE/PB/ROE/市值），使用精确十进制计算避免浮点误差。
-    自动从 playwright_service 获取股价/总股本/EPS/每股净资产后验算。"""
+    自动从 playwright_service 获取总股本/EPS/每股净资产，从腾讯行情获取实时股价后验算。"""
     try:
         from tradingagents.agents.utils.playwright_tools import _get_client
         client = _get_client()
@@ -358,23 +358,60 @@ def verify_stock_valuation(
             return f"[估值验算] {code}: 无法获取首页数据 - {hp.get('error', '')}"
         d = hp.get("data", {})
 
-        price = d.get("total_mcap_yi")
         pe_d = d.get("pe_dynamic")
         pe_s = d.get("pe_static")
         pb = d.get("pb")
+        mcap_yi = d.get("total_mcap_yi")
         ts = d.get("total_shares_yi")
         fs = d.get("float_shares_yi")
 
+        # Get precise real-time price from Tencent (avoid precision loss
+        # from dividing market_cap_yi / shares_yi which are both in 亿 unit)
+        price = None
+        price_source = ""
+        try:
+            from tradingagents.dataflows.a_stock import _tencent_quote
+            tq = _tencent_quote([code])
+            if code in tq:
+                price = tq[code].get("price")
+                price_source = "腾讯行情"
+        except Exception as e:
+            logger.warning("Tencent quote failed in verify_stock_valuation for %s: %s", code, str(e)[:200])
+
+        # Fallback 1: 东财 push2his 最新 K 线收盘价（精度到分）
+        if price is None:
+            try:
+                from tradingagents.dataflows.a_stock import _em_fetch_klines
+                klines = _em_fetch_klines(code, count=1)
+                if klines:
+                    price = klines[-1].get("close")
+                    price_source = "东财push2his(最新收盘价)"
+            except Exception as e:
+                logger.warning("Eastmoney kline fallback failed for %s: %s", code, str(e)[:200])
+
+        # Fallback 2: derive price from market_cap / shares (least precise, both in 亿)
+        if price is None and mcap_yi and ts and ts > 0:
+            price = mcap_yi / ts
+            price_source = "市值/股本推算(低精度)"
+            logger.info("Using fallback price %.4f (mcap/shares) for %s", price, code)
+
         lines = [f"# 估值验算 | {code}", "# 使用 Decimal 精确十进制计算", ""]
 
-        if ts is not None and price is not None:
-            # Verify market cap = total_shares * price (simplified, both in 亿)
-            mc_result = verify_market_cap(
-                price=1.0,  # placeholder, we verify PE/PB mainly
-                shares=ts,
-                reported_cap=ts,
-            )
+        if price is not None:
+            lines.append(f"股价: {price:.2f} 元 ({price_source})")
+        if ts is not None:
             lines.append(f"总股本: {ts:.4f}亿 | 流通A股: {fs:.4f}亿" if fs else f"总股本: {ts:.4f}亿")
+        if mcap_yi is not None:
+            lines.append(f"总市值: {mcap_yi:.2f}亿")
+
+        # Verify market cap = price * shares (cross-check reported vs calculated)
+        if price is not None and ts is not None and mcap_yi is not None:
+            mc_result = verify_market_cap(
+                price=price,
+                shares=ts * 1e8,  # convert 亿 to 股
+                reported_cap=mcap_yi * 1e8,  # convert 亿 to 元
+            )
+            lines.append(f"市值验算: {mc_result['text']} [{mc_result['status']}]")
 
         if pe_s is not None and pb is not None:
             # Cross-check PE and PB
@@ -397,7 +434,7 @@ def verify_stock_valuation(
             except (ValueError, TypeError):
                 lines.append(f"PE={pe_s}, PB={pb} (无法计算隐含ROE)")
 
-        # Get financial quarterly for EPS
+        # Get financial quarterly for EPS/BPS
         fq = client.financial_quarterly(code)
         if fq.get("success"):
             data = fq.get("data", [])
@@ -406,17 +443,20 @@ def verify_stock_valuation(
                 eps = latest.get("EPS")
                 bps = latest.get("BPS")
                 if eps and bps:
-                    val_result = verify_valuation(
-                        price=price if price else 0,
-                        eps=eps,
-                        bvps=bps,
-                    )
-                    if "PE" in val_result:
-                        lines.append(f"验算PE = 总市值/EPS = {val_result['PE']:.2f}x")
-                    if "PB" in val_result:
-                        lines.append(f"验算PB = 总市值/BPS = {val_result['PB']:.2f}x")
-                    if "ROE" in val_result:
-                        lines.append(f"验算ROE = EPS/BPS = {val_result['ROE']:.2f}%")
+                    if price is not None:
+                        val_result = verify_valuation(
+                            price=price,
+                            eps=eps,
+                            bvps=bps,
+                        )
+                        if "PE" in val_result:
+                            lines.append(f"验算PE = 股价/EPS = {val_result['PE']:.2f}x")
+                        if "PB" in val_result:
+                            lines.append(f"验算PB = 股价/BPS = {val_result['PB']:.2f}x")
+                        if "ROE" in val_result:
+                            lines.append(f"验算ROE = EPS/BPS = {val_result['ROE']:.2f}%")
+                    else:
+                        lines.append("无法验算 PE/PB: 腾讯行情与市值推算股价均不可用")
 
         return "\n".join(lines)
     except Exception as e:

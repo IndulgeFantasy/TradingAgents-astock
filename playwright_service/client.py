@@ -194,3 +194,7 @@ class PlaywrightClient:
     def eps_forecast(self, code: str) -> dict:
         """EPS一致预期 (同花顺F10): 机构盈利预测"""
         return self._get("/api/eps-forecast", {"code": code})
+
+    def executive_changes(self, code: str) -> dict:
+        """高管持股变动 (东方财富): 高管/大股东增减持明细"""
+        return self._get("/api/executive-changes", {"code": code})

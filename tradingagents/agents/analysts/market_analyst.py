@@ -8,8 +8,12 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_levels,
     get_chip_distribution,
     analyze_pattern,
+    retry_report_generation,
 )
 from tradingagents.dataflows.config import get_config
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_market_analyst(llm):
@@ -31,13 +35,13 @@ def create_market_analyst(llm):
             """你是一位专注于 A 股市场的技术分析师。你的任务是从以下技术指标中选择最多 **8 个**最相关的指标，为给定的 A 股标的提供技术面分析。选择时应注重指标间的互补性，避免冗余。
 
 ⚠️ A 股市场特殊规则（分析时必须纳入考量）：
-- **涨跌停制度**：主板 ±10%，科创板/创业板 ±20%，ST 股 ±5%。触及涨跌停后流动性骤降，技术指标可能失真。
+- **涨跌停制度**：主板 ±10%，科创板/创业板 ±20%，北交所 ±30%，ST 股 ±5%。触及涨跌停后流动性骤降，技术指标可能失真。
 - **T+1 交易制度**：当日买入次日才能卖出，短线策略的可执行性受限。
 - **北向资金**：外资通过沪深港通的流入流出是重要的市场风向标，大幅流入/流出常领先于趋势转折。
 - **换手率**：A 股散户占比高，换手率是判断资金活跃度和筹码松动的关键指标。
 - **量价关系**：A 股「量在价先」规律显著，放量突破和缩量回调是核心交易信号。
 
-📊 大盘环境参考：调用 get_market_context() 获取当前大盘整体情况（上证指数、沪深300等主要指数走势+两市成交额+涨跌家数+北向/南向资金+融资余额+领涨板块），结合大盘环境判断个股技术面信号的有效性，不过大盘对个股影响相对较小。
+📊 大盘环境参考：调用 get_market_context() 获取当前大盘整体情况（上证指数、沪深300、深证成指、创业板指、科创50、中证500、国证2000 共7大指数走势+均线+MACD+换手率+近5日K线(开盘/收盘/最高/最低/涨跌幅/成交量/成交额/换手率)+两市成交额+涨跌家数+北向/南向资金+融资余额+领涨板块），结合大盘环境判断个股技术面信号的有效性，不过大盘对个股影响相对较小。
 - 大盘处于上升趋势时，个股的技术买入信号更可靠
 - 大盘处于下跌趋势时，个股的技术支撑位更容易被跌破
 - 大盘震荡时，优先选择与大盘走势独立（alpha）的个股
@@ -89,9 +93,9 @@ MACD 类：
 - vwma：成交量加权均线 - 结合量价验证趋势的可靠性。注意异常放量可能扭曲结果。
 
 操作要求：
-1. **必须**先调用 get_stock_kline_full(code, days) 获取 K 线数据（含换手率/涨跌幅/ST标记）
-2. 再调用 get_indicators 获取选定指标（参数名使用上述英文标识符，否则调用会失败）
-3. **必须**调用 get_market_context() 了解当前大盘环境（上证指数/沪深300 走势是必采项，缺失会导致质量门降级）
+1. **第一步必须**调用 get_market_context() 获取当前大盘环境（7大指数：上证/沪深300/深证成指/创业板指/科创50/中证500/国证2000 走势+均线+MACD+换手率+近5日K线(开盘/收盘/最高/最低/涨跌幅/成交量/成交额/换手率)+两市成交额+涨跌家数+北向/南向资金+融资余额+领涨板块）。这是必采项，缺失会导致质量门降级。后续必采清单中的第6-12项数据全部依赖此工具，不调用将导致大量数据缺失。
+2. **必须**调用 get_stock_kline_full(code, days) 获取 K 线数据（含换手率/涨跌幅/ST标记）
+3. 调用 get_indicators 获取选定指标（参数名使用上述英文标识符，否则调用会失败）
 4. 撰写详细的技术分析报告，包含具体数值和技术信号研判结论（仅供研究参考，不构成投资建议）
 5. 报告**开头**必须包含「一、基础数据概览」表格，格式如下：
    | 项目 | 数值 |
@@ -102,8 +106,8 @@ MACD 类：
    | 近5日平均成交量 | XXX 股 |
    | 近20日平均成交量 | XXX 股 |
    | 量比（近5日/近20日） | X.XX倍 -> 放量/缩量约XX% |
-   | 所属板块 | 主板/创业板/科创板（±10%/±20%涨跌幅限制） |
-   数据从 get_stock_kline_full 返回的 K 线数据中计算。所属板块根据股票代码判断（688=科创板，300=创业板，60/00=主板）。
+   | 所属板块 | 主板/创业板/科创板/北交所（±10%/±20%/±30%涨跌幅限制，ST股±5%） |
+   数据从 get_stock_kline_full 返回的 K 线数据中计算。所属板块根据股票代码判断（688=科创板，300/301=创业板，60/00=主板，8/4=北交所；ST股无论哪个板块均为±5%涨跌幅限制）。
 6. 报告末尾附 Markdown 表格汇总关键技术信号和结论
 7. **必须**调用 get_stock_levels(code) 获取支撑位和压力位，作为关键价位判断依据
 
@@ -154,7 +158,17 @@ MACD 类：
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = result.content if result.content else ""
+            if not report.strip():
+                report = retry_report_generation(
+                    llm, state["messages"], result, "market_analyst"
+                )
+        else:
+            # LLM may return both tool_calls and content simultaneously.
+            # Keep the content as a candidate report so it's not lost.
+            report = result.content if result.content else ""
+            tool_names = [tc.get("name", "?") for tc in result.tool_calls]
+            logger.info("market_analyst: tool_calls=%s", tool_names)
 
         return {
             "messages": [result],

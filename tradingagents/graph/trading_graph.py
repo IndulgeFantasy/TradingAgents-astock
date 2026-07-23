@@ -215,6 +215,7 @@ class TradingAgentsGraph:
                     get_stock_homepage,
                     get_stock_industry_peers,
                     get_insider_transactions,
+                    get_stock_holder,
                     verify_stock_valuation,
                 ]
             ),
@@ -236,6 +237,7 @@ class TradingAgentsGraph:
                     get_dragon_tiger_board,
                     get_industry_comparison,
                     get_stock_position,
+                    get_stock_holder,
                     get_limit_up_pool,
                 ]
             ),

@@ -1,4 +1,5 @@
 from langchain_core.messages import HumanMessage, RemoveMessage
+import logging
 
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import (
@@ -62,6 +63,54 @@ def get_language_instruction() -> str:
     if lang.strip().lower() == "english":
         return ""
     return f" Write your entire response in {lang}."
+
+
+_logger = logging.getLogger(__name__)
+
+
+def retry_report_generation(llm, messages, result, analyst_name: str) -> str:
+    """Retry report generation when LLM returns empty content after tool calls.
+
+    Some models (e.g. glm-5.2) return tool_calls=[] with content="" after a
+    tool-use loop, as if the task is done but without generating the final
+    report text. This helper re-invokes the LLM *without* bound tools, forcing
+    it to produce a text response.
+
+    Args:
+        llm: The base LLM (without bind_tools) for the retry call.
+        messages: The conversation messages so far (state["messages"]).
+        result: The last AIMessage from the LLM (with empty content).
+        analyst_name: Name for logging (e.g. "market_analyst").
+
+    Returns:
+        The report text (may still be empty if retry also fails).
+    """
+    _logger.warning(
+        "%s: LLM returned no tool_calls but content is empty. "
+        "Retrying without tools to force report generation.",
+        analyst_name,
+    )
+    retry_msg = HumanMessage(
+        content="你已经获取了所有需要的数据。请根据上述工具返回的数据，"
+        "撰写完整的分析报告。不要调用任何工具，直接输出报告内容。"
+    )
+    try:
+        retry_result = llm.invoke(messages + [result, retry_msg])
+        report = retry_result.content if retry_result.content else ""
+        if report.strip():
+            _logger.info(
+                "%s: retry succeeded, report length=%d", analyst_name, len(report)
+            )
+        else:
+            _logger.warning(
+                "%s: retry also returned empty content", analyst_name
+            )
+        return report
+    except Exception as e:
+        _logger.warning(
+            "%s: retry failed: %s: %s", analyst_name, type(e).__name__, str(e)[:200]
+        )
+        return ""
 
 
 def build_instrument_context(ticker: str) -> str:

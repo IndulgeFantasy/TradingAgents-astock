@@ -23,6 +23,7 @@ import os
 import sys
 import argparse
 import traceback
+import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from functools import wraps
@@ -76,6 +77,68 @@ def _parse_sse_lines(text: str):
             yield json.loads(line[5:])
         except (json.JSONDecodeError, ValueError):
             continue
+
+
+def _extract_wencai_components(data_list):
+    """Extract components list from iwencai response.
+
+    Supports two API formats:
+    - v2 JSON (get-robot-data): data.answer[0].txt[0].content.components
+    - Legacy SSE (stream-query): each line has section.result_page.components
+    """
+    all_comps = []
+    for d in data_list:
+        # v2 JSON format: top-level {status_code, data: {answer: [...]}}
+        # also handle case where d itself is the inner data dict
+        root = d.get("data", d)
+        answer = root.get("answer", []) if isinstance(root, dict) else []
+        if answer:
+            txt = answer[0].get("txt", [])
+            if txt:
+                comps = txt[0].get("content", {}).get("components", [])
+                all_comps.extend(comps)
+        # Legacy SSE format (fallback)
+        comps = d.get("section", {}).get("result_page", {}).get("components", [])
+        all_comps.extend(comps)
+    return all_comps
+
+
+async def _fetch_wencai_page(page, code):
+    """Navigate to iwencai and capture the API response.
+
+    Supports both v2 (get-robot-data, JSON) and legacy (stream-query, SSE).
+    Returns a list of parsed JSON dicts.
+    """
+    async with page.expect_event(
+        "response",
+        predicate=lambda r: "get-robot-data" in r.url or "stream-query" in r.url,
+        timeout=20000,
+    ) as event_info:
+        await page.goto(
+            f"https://www.iwencai.com/unifiedwap/result?w={code}",
+            wait_until="domcontentloaded",
+        )
+    response = await event_info.value
+    text = await response.text()
+
+    # v2 JSON format: single JSON object
+    import json
+    try:
+        data = json.loads(text)
+        return [data]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Legacy SSE format: multiple "data: {...}" lines
+    results = []
+    for line in text.strip().split("\n"):
+        if not line.startswith("data:"):
+            continue
+        try:
+            results.append(json.loads(line[5:]))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return results
 
 
 # ── 缓存装饰器 ──
@@ -274,14 +337,15 @@ def fetch_market_overview():
             browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
             try:
                 ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                page = await ctx.new_page()
-                await page.set_viewport_size({"width": 1280, "height": 800})
 
                 indices = [
                     ("000001", "上证指数"),
                     ("000300", "沪深300"),
                     ("399001", "深证成指"),
                     ("399006", "创业板指"),
+                    ("000688", "科创50"),
+                    ("000905", "中证500"),
+                    ("399303", "国证2000"),
                 ]
                 results = {}
                 errors = []
@@ -298,6 +362,9 @@ def fetch_market_overview():
                     secid = f"1.{code}" if code.startswith(("0", "6")) else f"0.{code}"
                     url = f"https://quote.eastmoney.com/zs{code}.html"
                     captured = {"kline_list": [], "price": None}
+                    # 每个指数用独立 page，避免 TargetClosedError
+                    page = await ctx.new_page()
+                    await page.set_viewport_size({"width": 1280, "height": 800})
 
                     async def on_response(resp, idx=idx):
                         url_match = resp.url
@@ -315,15 +382,31 @@ def fetch_market_overview():
 
                             # K 线历史 — 用列表收集所有 kline 响应，取第一个有效结果
                             # (东财指数页面可能同时请求多个 kline API，后到的会覆盖先到的)
-                            if "api/qt/stock/kline/get" in url_match:
-                                klines = d.get("data", {}).get("klines", [])
-                                if klines:
+                            if "api/qt/stock/kline/get" in url_match and "smplmt" not in url_match:
+                                klines_raw = d.get("data", {}).get("klines", [])
+                                if klines_raw:
                                     parsed = []
-                                    for k in klines:
+                                    for k in klines_raw:
                                         parts = k.split(",")
-                                        if len(parts) >= 5:
-                                            try: parsed.append({"close": float(parts[2]), "volume": float(parts[5]) if len(parts) >= 6 else 0})
-                                            except: pass
+                                        if len(parts) >= 6:
+                                            try:
+                                                entry = {
+                                                    "date": parts[0],
+                                                    "open": float(parts[1]),
+                                                    "close": float(parts[2]),
+                                                    "high": float(parts[3]),
+                                                    "low": float(parts[4]),
+                                                    "volume": float(parts[5]),
+                                                }
+                                                if len(parts) >= 7:
+                                                    entry["amount"] = float(parts[6])
+                                                if len(parts) >= 9:
+                                                    entry["pctChg"] = float(parts[8])
+                                                if len(parts) >= 11:
+                                                    entry["turnover"] = float(parts[10])
+                                                parsed.append(entry)
+                                            except (ValueError, IndexError):
+                                                pass
                                     if len(parsed) >= 2:
                                         captured["kline_list"].append(parsed)
 
@@ -392,7 +475,9 @@ def fetch_market_overview():
                             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                         await page.wait_for_timeout(2000)
 
-                        klines = captured["kline_list"][0] if captured["kline_list"] else []
+                        # 东财指数页面可能返回多套 K 线（长期日K + 短期日K），
+                        # 取最后捕获的那个（通常是页面主图的日K，长度 60-120）
+                        klines = captured["kline_list"][-1] if captured["kline_list"] else []
 
                         if klines and len(klines) >= 62:
                             last = klines[-1]
@@ -409,10 +494,11 @@ def fetch_market_overview():
                                 "近60日涨跌幅": chg_60d,
                             }
 
-                            # 上证指数额外计算: 均线 + 量价分析
-                            if idx == 0 and len(klines) >= 60:
+                            # 所有指数: 均线 + 量价 + 近5日K线摘要
+                            if len(klines) >= 60:
                                 closes = [k["close"] for k in klines]
                                 vols = [k.get("volume", 0) for k in klines]
+                                turnovers = [k.get("turnover", 0) for k in klines if k.get("turnover")]
                                 ma5 = sum(closes[-5:]) / 5
                                 ma10 = sum(closes[-10:]) / 10
                                 ma20 = sum(closes[-20:]) / 20
@@ -442,6 +528,51 @@ def fetch_market_overview():
                                 }
                                 results[name]["量价"] = vol_price
                                 results[name]["成交量"] = round(vol_now, 0)
+                                if turnovers:
+                                    results[name]["换手率"] = round(turnovers[-1], 2)
+                                # MACD (12,26,9)
+                                if len(closes) >= 35:
+                                    ema12 = closes[0]
+                                    for c in closes[1:]:
+                                        ema12 = c * 2 / 13 + ema12 * 11 / 13
+                                    ema26 = closes[0]
+                                    for c in closes[1:]:
+                                        ema26 = c * 2 / 27 + ema26 * 25 / 27
+                                    dif = ema12 - ema26
+                                    # DEA 是 DIF 的 9 日 EMA，简化用最近 9 日 DIF 序列
+                                    difs = []
+                                    ema12_r = closes[0]
+                                    ema26_r = closes[0]
+                                    for c in closes[1:]:
+                                        ema12_r = c * 2 / 13 + ema12_r * 11 / 13
+                                        ema26_r = c * 2 / 27 + ema26_r * 25 / 27
+                                        difs.append(ema12_r - ema26_r)
+                                    if len(difs) >= 9:
+                                        dea = difs[-9]
+                                        for d in difs[-8:]:
+                                            dea = d * 2 / 10 + dea * 8 / 10
+                                        macd = (dif - dea) * 2
+                                        results[name]["MACD"] = {
+                                            "DIF": round(dif, 2),
+                                            "DEA": round(dea, 2),
+                                            "MACD": round(macd, 2),
+                                        }
+                                # 近5日K线摘要
+                                recent_5 = klines[-5:]
+                                results[name]["近5日"] = [
+                                    {
+                                        "date": k.get("date", ""),
+                                        "open": k.get("open", 0),
+                                        "close": k["close"],
+                                        "high": k.get("high", 0),
+                                        "low": k.get("low", 0),
+                                        "pctChg": k.get("pctChg", 0),
+                                        "volume": k.get("volume", 0),
+                                        "amount": k.get("amount", 0),
+                                        "turnover": k.get("turnover", 0),
+                                    }
+                                    for k in recent_5
+                                ]
                         else:
                             errors.append(f"{code}: 无K线数据")
 
@@ -453,6 +584,12 @@ def fetch_market_overview():
                             page.remove_listener("response", on_response)
                         except Exception:
                             pass
+                        # 每个指数用独立 page，处理完后关闭
+                        if idx > 0:
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
 
                     # 首次加载完成后，从 DOM 提取额外数据
                     if idx == 0:
@@ -628,14 +765,32 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                 expected_secid = f"secid={market_id}.{code}"
 
                 captured_list = []
+                limit_prices = {}  # 涨停价/跌停价 from push2 stock/get
                 async def on_resp(resp):
-                    if "push2his.eastmoney.com/api/qt/stock/kline/get" in resp.url:
+                    if "push2his.eastmoney.com/api/qt/stock/kline/get" in resp.url and "smplmt" not in resp.url:
                         try:
                             body = await resp.text()
                             import re, json
                             body = re.sub(r'^\w+\(|\)[^)]*$', '', body)
                             data = json.loads(body)
                             captured_list.append((resp.url, data))
+                        except Exception:
+                            pass
+                    elif "push2.eastmoney.com/api/qt/stock/get" in resp.url:
+                        # 捕获涨停价(f51)/跌停价(f52)/最新价(f43)/昨收(f60)
+                        try:
+                            body = await resp.text()
+                            import re, json
+                            body = re.sub(r'^\w+\(|\)[^)]*$', '', body)
+                            data = json.loads(body)
+                            d = data.get("data", {}) or {}
+                            if d.get("f51") and d.get("f52") and str(d.get("f57","")) == code:
+                                limit_prices["limit_up"] = d["f51"] / 100
+                                limit_prices["limit_down"] = d["f52"] / 100
+                                if d.get("f43"):
+                                    limit_prices["price"] = d["f43"] / 100
+                                if d.get("f60"):
+                                    limit_prices["last_close"] = d["f60"] / 100
                         except Exception:
                             pass
 
@@ -711,6 +866,8 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                     "stock_name": stock_name,
                     "resp_code": resp_code,
                 }
+                if limit_prices:
+                    result["limit_prices"] = limit_prices
                 if resp_code and resp_code != code:
                     result["warning"] = f"响应代码({resp_code})与请求代码({code})不匹配，可能数据源返回了指数"
                 return result
@@ -967,9 +1124,12 @@ def fetch_stock_equity_history(code: str):
 def fetch_stock_holder(code: str):
     """
     通过 playwright 访问同花顺 F10 holder 页面，提取:
-    1. 股东人数多期时序 (10期)
-    2. 前十大流通股东 (多期)
-    3. 机构/基金持股变化
+    1. 股东人数多期时序 (10期，含股东人数/环比变化/行业平均/户均流通股/户均流通市值)
+    2. 前十大流通股东 (多期，含持股数/增减/占比/质押比例/变动比例)
+    3. 前十大股东 (按总股本，含持股数/增减/占比/质押比例/实控人性质)
+    4. 退出前十大流通股东列表 (减持信号)
+    5. 退出前十大股东列表
+    6. 同业股东人数变化对比 (top10 增加/减少最多)
     """
     import asyncio
     try:
@@ -992,7 +1152,88 @@ def fetch_stock_holder(code: str):
 
                 result = await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
-                    const out = { shareHolderCount: [], top10Holders: [] };
+                    const out = {
+                        shareHolderCount: [],
+                        top10Holders: [],
+                        top10Shareholders: [],
+                        exitedFloatHolders: [],
+                        exitedShareholders: [],
+                        peerComparison: { topIncrease: [], topDecrease: [] }
+                    };
+
+                    // Helper: collect date labels from fdates/tdates links
+                    // fdates -> 流通股东 period tabs, tdates -> 十大股东 period tabs
+                    function collectDates(cls) {
+                        const links = document.querySelectorAll('a.' + cls);
+                        return Array.from(links).map(a => a.textContent.trim()).filter(Boolean);
+                    }
+                    const floatDates = collectDates('fdates');
+                    const totalDates = collectDates('tdates');
+
+                    // Helper: extract holder rows from a table by header-name mapping
+                    // This avoids column-index fragility when optional columns (pledge) exist.
+                    function extractHolders(table) {
+                        const rows = table.rows;
+                        if (rows.length < 2) return [];
+                        // find header row: the row containing "机构或基金名称" or "股东名称"
+                        let headerRowIdx = -1;
+                        for (let i = 0; i < Math.min(rows.length, 3); i++) {
+                            const txt = (rows[i].textContent || '').trim();
+                            if (txt.includes('机构或基金名称') || txt.includes('股东名称')) {
+                                headerRowIdx = i;
+                                break;
+                            }
+                        }
+                        if (headerRowIdx < 0) return [];
+
+                        // build column index map from header cell text
+                        const headerCells = Array.from(rows[headerRowIdx].querySelectorAll('td, th'));
+                        const colMap = {};
+                        headerCells.forEach((c, idx) => {
+                            const t = (c.textContent || '').trim();
+                            if (t.includes('名称')) colMap.name = idx;
+                            else if (t.includes('持有数量') || t.includes('持股数')) colMap.shares = idx;
+                            else if (t.includes('持股变化') || t.includes('增减')) colMap.change = idx;
+                            else if (t.includes('占流通') || t.includes('占总股') || t.includes('占比')) colMap.ratio = idx;
+                            else if (t.includes('质押') || t.includes('冻结')) colMap.pledgeRatio = idx;
+                            else if (t.includes('变动比例')) colMap.changePct = idx;
+                            else if (t.includes('股份类型') || t.includes('持股性质')) colMap.shareType = idx;
+                        });
+
+                        const holders = [];
+                        for (let r = headerRowIdx + 1; r < rows.length; r++) {
+                            const cells = Array.from(rows[r].querySelectorAll('td, th')).map(c => (c.textContent || '').trim());
+                            if (cells.length < 3) continue;
+                            const name = colMap.name !== undefined ? cells[colMap.name] : cells[0];
+                            if (!name || name.includes('机构或基金名称') || name.includes('股东名称')
+                                || name.includes('前十大') || name.includes('累计持有')
+                                || name.includes('退出')) continue;
+                            const holder = { name: name };
+                            if (colMap.shares !== undefined) holder.shares = cells[colMap.shares] || '';
+                            if (colMap.change !== undefined) holder.change = (cells[colMap.change] || '').slice(0, 40);
+                            if (colMap.ratio !== undefined) holder.ratio = cells[colMap.ratio] || '';
+                            if (colMap.pledgeRatio !== undefined) holder.pledgeRatio = cells[colMap.pledgeRatio] || '';
+                            if (colMap.changePct !== undefined) holder.changePct = cells[colMap.changePct] || '';
+                            if (colMap.shareType !== undefined) holder.shareType = cells[colMap.shareType] || '';
+                            holders.push(holder);
+                        }
+                        return holders;
+                    }
+
+                    // Helper: classify a table by which h2 section it belongs to
+                    const allH2 = document.querySelectorAll('h2');
+                    const h2List = Array.from(allH2);
+                    function sectionOf(table) {
+                        let section = '';
+                        for (const h of h2List) {
+                            if (h.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                section = h.textContent.trim();
+                            } else {
+                                break;
+                            }
+                        }
+                        return section;
+                    }
 
                     // 1. 股东人数时序: table[1]标签, table[2]日期, table[3]数据
                     if (tables.length >= 4) {
@@ -1007,38 +1248,78 @@ def fetch_stock_holder(code: str):
                             const entry = { date: dates[i] };
                             for (let j = 0; j < labels.length && j < dataRows.length; j++) {
                                 if (i < dataRows[j].length) {
-                                    entry[labels[j].replace(/\\\\s/g, '_')] = dataRows[j][i];
+                                    entry[labels[j].replace(/\\s+/g, '_')] = dataRows[j][i];
                                 }
                             }
                             out.shareHolderCount.push(entry);
                         }
                     }
 
-                    // 2. 前十大流通股东: table[6]及后续table为多期
-                    for (let ti = 6; ti < tables.length && ti < 10; ti++) {
+                    // 2 & 3. 十大流通股东 + 十大股东: classify by section, attach dates from fdates/tdates
+                    let floatIdx = 0;
+                    let totalIdx = 0;
+                    for (let ti = 0; ti < tables.length; ti++) {
                         const table = tables[ti];
+                        const section = sectionOf(table);
+                        if (!section) continue;
+                        if (section.includes('股东人数')) continue;
+                        if (section.includes('同业')) continue;
                         if (table.rows.length < 3) continue;
-                        // 第一行通常有汇总文字
-                        const summary = (table.rows[0]?.textContent || '').trim().slice(0, 150);
-                        const holderInfo = { summary: summary, holders: [] };
-                        // 跳过表头行
-                        let startRow = 1;
-                        for (let r = startRow; r < table.rows.length; r++) {
-                            const cells = table.rows[r].querySelectorAll('td, th');
-                            if (cells.length >= 4) {
-                                const name = cells[0]?.textContent?.trim() || '';
-                                if (name && !name.includes('机构或基金名称') && !name.includes('前十大')) {
-                                    holderInfo.holders.push({
-                                        name: name,
-                                        shares: cells[1]?.textContent?.trim() || '',
-                                        change: (cells[2]?.textContent?.trim() || '').slice(0, 30),
-                                        ratio: cells[3]?.textContent?.trim() || '',
-                                    });
-                                }
-                            }
+
+                        const summary = (table.rows[0]?.textContent || '').trim().slice(0, 200);
+                        const holders = extractHolders(table);
+                        if (holders.length === 0) continue;
+
+                        if (section.includes('流通')) {
+                            const period = floatIdx < floatDates.length ? floatDates[floatIdx] : '';
+                            floatIdx++;
+                            out.top10Holders.push({ summary: summary, period: period, holders: holders });
+                        } else if (section.includes('十大股东')) {
+                            const period = totalIdx < totalDates.length ? totalDates[totalIdx] : '';
+                            totalIdx++;
+                            out.top10Shareholders.push({ summary: summary, period: period, holders: holders });
                         }
-                        if (holderInfo.holders.length > 0) {
-                            out.top10Holders.push(holderInfo);
+                    }
+
+                    // 4 & 5. 退出前十大: tables whose text contains "退出前十大"
+                    for (let ti = 0; ti < tables.length; ti++) {
+                        const table = tables[ti];
+                        const txt = (table.textContent || '').trim();
+                        if (txt.includes('退出前十大流通股东')) {
+                            const holders = extractHolders(table);
+                            for (const h of holders) out.exitedFloatHolders.push(h);
+                        } else if (txt.includes('退出前十大股东')) {
+                            const holders = extractHolders(table);
+                            for (const h of holders) out.exitedShareholders.push(h);
+                        }
+                    }
+
+                    // 6. 同业股东人数变化对比: tables under "同业" section
+                    // page has two sub-tables: "增加最多" and "减少最多"
+                    // distinguish by scanning preceding sibling text
+                    for (let ti = 0; ti < tables.length; ti++) {
+                        const table = tables[ti];
+                        const section = sectionOf(table);
+                        if (!section || !section.includes('同业')) continue;
+                        // find preceding heading text to classify increase vs decrease
+                        let isDecrease = false;
+                        let node = table.previousElementSibling;
+                        while (node) {
+                            const t = (node.textContent || '').trim();
+                            if (t.includes('减少') || t.includes('下降')) { isDecrease = true; break; }
+                            if (t.includes('增加') || t.includes('上升')) { isDecrease = false; break; }
+                            node = node.previousElementSibling;
+                        }
+                        const rows = [];
+                        for (const tr of table.querySelectorAll('tr')) {
+                            const cells = Array.from(tr.querySelectorAll('td, th')).map(td => td.textContent.trim());
+                            if (cells.length >= 3) rows.push(cells);
+                        }
+                        const target = isDecrease ? out.peerComparison.topDecrease : out.peerComparison.topIncrease;
+                        for (const r of rows.slice(1)) {
+                            if (r[0] && !r[0].includes('股票简称') && r[0] !== code) {
+                                target.push({ name: r[0], count: r[1] || '', change: r[2] || '' });
+                            }
                         }
                     }
 
@@ -1164,10 +1445,11 @@ def fetch_stock_position(code: str):
 @cached(ttl=3600)
 def fetch_financial_quarterly(code: str):
     """
-    通过 playwright 访问同花顺 F10 finance 页面，提取财务指标矩阵。
-    替换原 baostock 实现。
-
-    返回最近 4 期的: 营收/净利润同比、ROE、毛利率、每股现金流等。
+    通过 playwright 访问同花顺 F10 finance 页面，提取:
+    1. 财务指标矩阵 (29 个指标 × 最近 8 期，覆盖成长/每股/盈利/运营/偿债五大维度)
+    2. 指标变动说明 (5 个子表：成长/盈利/负债/运营/现金流，含变动原因文字说明)
+    3. 财务报告审计意见 (最近 4 年年报审计意见)
+    4. 资产负债构成 (资产 6 行 + 负债 5 行)
     """
     import asyncio
     try:
@@ -1188,23 +1470,77 @@ def fetch_financial_quarterly(code: str):
                 )
                 await page.wait_for_timeout(8000)
 
-                # 提取财务矩阵: labels(指标名), dates(报告期), dataRows(数值)
-                matrix = await page.evaluate("""() => {
+                # === 1. 财务指标矩阵 + 2. 指标变动说明 + 3. 审计意见 + 4. 资产负债构成 ===
+                raw = await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
-                    if (tables.length < 5) return null;
-                    // table[0] = "科目\\年度", table[1] = 行标签, table[2] = 日期头, table[4] = 数据
-                    const labels = Array.from(tables[1].querySelectorAll('td, th')).map(td => td.textContent.trim());
-                    const dates = Array.from(tables[2].querySelectorAll('td, th')).map(td => td.textContent.trim());
-                    const dataRows = [];
-                    for (const tr of tables[4].querySelectorAll('tr')) {
-                        const cells = Array.from(tr.querySelectorAll('td, th')).map(td => td.textContent.trim());
-                        dataRows.push(cells);
+                    const out = { matrix: null, changes: [], audit: [], assets: [], liabilities: [] };
+
+                    // --- 1. 财务指标矩阵 ---
+                    if (tables.length >= 5) {
+                        const labels = Array.from(tables[1].querySelectorAll('td, th')).map(td => td.textContent.trim());
+                        const dates = Array.from(tables[2].querySelectorAll('td, th')).map(td => td.textContent.trim());
+                        const dataRows = [];
+                        for (const tr of tables[4].querySelectorAll('tr')) {
+                            const cells = Array.from(tr.querySelectorAll('td, th')).map(td => td.textContent.trim());
+                            dataRows.push(cells);
+                        }
+                        out.matrix = { labels, dates, dataRows };
                     }
-                    return { labels, dates, dataRows };
+
+                    // --- 2. 指标变动说明: header 含"变动科目"+"变动原因"的表格 ---
+                    for (const t of tables) {
+                        const headerText = (t.rows[0]?.textContent || '').trim();
+                        if (headerText.includes('变动科目') && headerText.includes('变动原因')) {
+                            const rows = [];
+                            for (const tr of t.querySelectorAll('tr')) {
+                                const cells = Array.from(tr.querySelectorAll('td, th')).map(c => c.textContent.trim());
+                                if (cells.length >= 5) rows.push(cells);
+                            }
+                            if (rows.length > 1) out.changes.push(rows);
+                        }
+                    }
+
+                    // --- 3. 审计意见: header 含"年份"+"审计意见" ---
+                    for (const t of tables) {
+                        const headerText = (t.rows[0]?.textContent || '').trim();
+                        if (headerText.includes('年份') && headerText.includes('审计意见')) {
+                            for (let ri = 1; ri < t.rows.length; ri++) {  // skip header row
+                                const cells = Array.from(t.rows[ri].querySelectorAll('td, th')).map(c => c.textContent.trim());
+                                if (cells.length >= 6 && cells[0] && cells[0] !== '年份') out.audit.push({
+                                    year: cells[0], q1: cells[1], mid: cells[2],
+                                    q3: cells[3], annual: cells[4], opinion: cells[5]
+                                });
+                            }
+                            break;
+                        }
+                    }
+
+                    // --- 4. 资产负债构成: header 含"科目"+"金额"，不含"变动" ---
+                    for (const t of tables) {
+                        const headerText = (t.rows[0]?.textContent || '').trim();
+                        if (headerText.includes('科目') && headerText.includes('金额') && !headerText.includes('变动')) {
+                            const rows = [];
+                            for (let ri = 1; ri < t.rows.length; ri++) {  // skip header row
+                                const cells = Array.from(t.rows[ri].querySelectorAll('td, th')).map(c => c.textContent.trim());
+                                if (cells.length >= 2 && cells[0] && cells[0] !== '科目') rows.push({ name: cells[0], value: cells[1] });
+                            }
+                            // 区分资产表 vs 负债表：资产表含"流动资产"或"资产总计"
+                            const allText = rows.map(r => r.name).join('');
+                            if (allText.includes('资产总计') || allText.includes('流动资产')) {
+                                out.assets = rows;
+                            } else if (allText.includes('负债总计') || allText.includes('流动负债')) {
+                                out.liabilities = rows;
+                            }
+                        }
+                    }
+
+                    return out;
                 }""")
-                if not matrix:
+
+                if not raw or not raw.get("matrix"):
                     return {"success": False, "error": "未找到财务数据表格"}
 
+                matrix = raw["matrix"]
                 labels = matrix["labels"]
                 dates = matrix["dates"]
                 dataRows = matrix["dataRows"]
@@ -1216,26 +1552,49 @@ def fetch_financial_quarterly(code: str):
                             return i
                     return None
 
-                idx_ni = idx_of(["净利润(元)"])
-                idx_ni_yoy = idx_of(["净利润同比增长率"])
-                idx_rev = idx_of(["营业总收入(元)"])
-                idx_rev_yoy = idx_of(["营业总收入同比增长率"])
-                idx_kj_ni = idx_of(["扣非净利润(元)"])
-                idx_kj_ni_yoy = idx_of(["扣非净利润同比增长率"])
-                idx_eps = idx_of(["基本每股收益(元)"])
-                idx_bps = idx_of(["每股净资产(元)"])
-                idx_cfps = idx_of(["每股经营现金流(元)"])
-                idx_roe = idx_of(["净资产收益率"])
-                idx_gross = idx_of(["销售毛利率"])
-                idx_net_margin = idx_of(["销售净利率"])
-                idx_debt = idx_of(["资产负债率"])
-                idx_capital = idx_of(["每股资本公积金(元)"])
-                idx_retained = idx_of(["每股未分配利润(元)"])
+                # 全部 29 个指标的行索引映射
+                indicator_map = {
+                    # 成长能力 (7)
+                    "NetProfit": ["净利润(元)"],
+                    "YOYNI": ["净利润同比增长率"],
+                    "CoreProfit": ["扣非净利润(元)"],
+                    "YOYCoreProfit": ["扣非净利润同比增长率"],
+                    "Revenue": ["营业总收入(元)"],
+                    "YOYRevenue": ["营业总收入同比增长率"],
+                    # 每股指标 (5)
+                    "EPS": ["基本每股收益(元)"],
+                    "BPS": ["每股净资产(元)"],
+                    "CapitalReserve": ["每股资本公积金(元)"],
+                    "RetainedEarning": ["每股未分配利润(元)"],
+                    "CFPS": ["每股经营现金流(元)"],
+                    # 盈利能力 (4)
+                    "NetMargin": ["销售净利率"],
+                    "GrossMargin": ["销售毛利率"],
+                    "ROE": ["净资产收益率"],
+                    "ROEDiluted": ["净资产收益率-摊薄"],
+                    # 运营能力 (4)
+                    "OperatingCycle": ["营业周期"],
+                    "InventoryTurnover": ["存货周转率"],
+                    "InventoryDays": ["存货周转天数"],
+                    "ReceivableDays": ["应收账款周转天数"],
+                    # 偿债能力 (5)
+                    "CurrentRatio": ["流动比率"],
+                    "QuickRatio": ["速动比率"],
+                    "ConservativeQuickRatio": ["保守速动比率"],
+                    "EquityRatio": ["产权比率"],
+                    "DebtRatio": ["资产负债率"],
+                }
 
-                # 辅助: 解析数值字符串 ("53.95亿" → 53.95, "48.74亿" → 48.74)
+                idx_map = {}
+                for key, keywords in indicator_map.items():
+                    idx = idx_of(keywords)
+                    if idx is not None:
+                        idx_map[key] = idx
+
+                # 辅助: 解析数值字符串 ("53.95亿" -> 53.95, "48.74亿" -> 48.74)
                 import re
                 def parse_val(s):
-                    if not s or s == "--" or s == "—":
+                    if not s or s == "--" or s == "-":
                         return None
                     s = s.replace(",", "").replace(" ", "").replace("\u00a0", "")
                     neg = 1
@@ -1250,7 +1609,7 @@ def fetch_financial_quarterly(code: str):
                         unit = 1
                         s = s.replace("亿", "")
                     elif "万" in s:
-                        unit = 0.0001  # 万 → 亿
+                        unit = 0.0001  # 万 -> 亿
                         s = s.replace("万", "")
                     m = re.search(r'[-]?[\d.]+', s)
                     if m:
@@ -1260,10 +1619,11 @@ def fetch_financial_quarterly(code: str):
                             return None
                     return None
 
-                # 取最近 4 期数据（每 3 个月一期）
-                max_cols = min(12, len(dates), len(dataRows[0]) if dataRows else 0)
+                # 取最近 8 期数据
+                max_cols = min(len(dates), len(dataRows[0]) if dataRows else 0)
+                num_periods = min(8, max_cols)
                 results = []
-                for col in range(0, min(4, max_cols)):
+                for col in range(0, num_periods):
                     ds = dates[col] if col < len(dates) else ""
                     # 提取季度标识
                     period = ""
@@ -1284,72 +1644,15 @@ def fetch_financial_quarterly(code: str):
                             return parse_val(dataRows[idx][col])
                         return None
 
-                    # 净利润同比
-                    ni_yoy = row_val(idx_ni_yoy, col)
-                    if ni_yoy is not None:
-                        entry["YOYNI"] = round(ni_yoy, 2)
-                        entry["YOYNI_label"] = f"{ni_yoy:+.2f}%"
-
-                    # 营收同比
-                    rev_yoy = row_val(idx_rev_yoy, col)
-                    if rev_yoy is not None:
-                        entry["YOYRevenue"] = round(rev_yoy, 2)
-                        entry["YOYRevenue_label"] = f"{rev_yoy:+.2f}%"
-
-                    # 扣非净利润同比
-                    kj_ni_yoy = row_val(idx_kj_ni_yoy, col)
-                    if kj_ni_yoy is not None:
-                        entry["YOYCoreProfit"] = round(kj_ni_yoy, 2)
-                        entry["YOYCoreProfit_label"] = f"{kj_ni_yoy:+.2f}%"
-
-                    # 每股收益
-                    eps = row_val(idx_eps, col)
-                    if eps is not None:
-                        entry["EPS"] = eps
-
-                    # 每股净资产
-                    bps = row_val(idx_bps, col)
-                    if bps is not None:
-                        entry["BPS"] = bps
-
-                    # 每股经营现金流
-                    cfps = row_val(idx_cfps, col)
-                    if cfps is not None:
-                        entry["CFPS"] = cfps
-
-                    # ROE
-                    roe = row_val(idx_roe, col)
-                    if roe is not None:
-                        entry["ROE"] = round(roe, 2)
-                        entry["ROE_label"] = f"{roe:.2f}%"
-
-                    # 毛利率
-                    gross = row_val(idx_gross, col)
-                    if gross is not None:
-                        entry["GrossMargin"] = round(gross, 2)
-                        entry["GrossMargin_label"] = f"{gross:.2f}%"
-
-                    # 净利率
-                    net_margin = row_val(idx_net_margin, col)
-                    if net_margin is not None:
-                        entry["NetMargin"] = round(net_margin, 2)
-                        entry["NetMargin_label"] = f"{net_margin:.2f}%"
-
-                    # 资产负债率
-                    debt = row_val(idx_debt, col)
-                    if debt is not None:
-                        entry["DebtRatio"] = round(debt, 2)
-                        entry["DebtRatio_label"] = f"{debt:.2f}%"
-
-                    # 净利润(元)
-                    ni = row_val(idx_ni, col)
-                    if ni is not None:
-                        entry["NetProfit"] = ni  # 亿
-
-                    # 营业总收入(元)
-                    rev = row_val(idx_rev, col)
-                    if rev is not None:
-                        entry["Revenue"] = rev  # 亿
+                    # 抓全部 29 个指标
+                    for key, idx in idx_map.items():
+                        val = row_val(idx, col)
+                        if val is not None:
+                            entry[key] = round(val, 4) if abs(val) > 100 else round(val, 2)
+                            # 百分比指标加 _label
+                            if key in ("YOYNI", "YOYCoreProfit", "YOYRevenue", "ROE", "ROEDiluted",
+                                       "NetMargin", "GrossMargin", "DebtRatio"):
+                                entry[f"{key}_label"] = f"{val:+.2f}%" if key.startswith("YOY") else f"{val:.2f}%"
 
                     # 经营现金流/净利润比 (CFPS / EPS)
                     if entry.get("CFPS") and entry.get("EPS") and entry["EPS"] != 0:
@@ -1360,7 +1663,7 @@ def fetch_financial_quarterly(code: str):
                 if not results:
                     return {"success": False, "error": f"finance.html 无 {code} 财务数据"}
 
-                # 构建 summary
+                # 构建 summary（最新一期）
                 latest = results[0]
                 summary = {}
                 for key, label in [
@@ -1378,12 +1681,33 @@ def fetch_financial_quarterly(code: str):
                 if latest.get("EPS"):
                     summary["每股收益"] = latest["EPS"]
 
+                # === 2. 指标变动说明 ===
+                changes_data = []
+                for table_rows in raw.get("changes", []):
+                    for r in table_rows[1:]:  # skip header
+                        if len(r) >= 5:
+                            changes_data.append({
+                                "subject": r[0], "current": r[1], "previous": r[2],
+                                "change_pct": r[3], "reason": r[4][:150]
+                            })
+
+                # === 3. 审计意见 ===
+                audit_data = raw.get("audit", [])
+
+                # === 4. 资产负债构成 ===
+                assets_data = raw.get("assets", [])
+                liabilities_data = raw.get("liabilities", [])
+
                 return {
                     "success": True,
                     "data": results,
                     "rows": len(results),
                     "source": "同花顺F10",
                     "summary": summary,
+                    "changes": changes_data,
+                    "audit": audit_data,
+                    "assets": assets_data,
+                    "liabilities": liabilities_data,
                 }
 
             finally:
@@ -1596,10 +1920,10 @@ def fetch_fund_flow_wencai(code: str):
     """
     通过 playwright 查询问财，提取:
     1. barline3: 30日主力资金时间序列（替代东财 push2）
-    2. impressionLabel: 所属概念板块
+    2. barline3: dde散户数量变化趋势
+    3. impressionLabel: 所属概念板块
 
-    性能优化: 用 expect_event(stream-query) + domcontentloaded 替代
-    networkidle + 固定8秒等待，耗时从 ~14s 降至 ~4s。
+    适配问财 v2 API (get-robot-data)，兼容旧版 stream-query SSE。
     """
     import asyncio
     try:
@@ -1609,68 +1933,63 @@ def fetch_fund_flow_wencai(code: str):
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
                 try:
-                    ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = await ctx.new_page()
+                    ctx = browser.contexts[0]
+                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                     await page.set_viewport_size({"width": 1280, "height": 800})
 
-                    # 用 expect_event 等待 stream-query 响应到达，避免
-                    # networkidle(5s+) + 固定8秒等待 = 14s 的开销
-                    async with page.expect_event(
-                        "response",
-                        predicate=lambda r: "stream-query" in r.url,
-                        timeout=20000
-                    ) as event_info:
-                        await page.goto(
-                            f"https://www.iwencai.com/unifiedwap/result?w={code}",
-                            wait_until="domcontentloaded"
-                        )
-                    response = await event_info.value
-                    text = await response.text()
+                    data = await _fetch_wencai_page(page, code)
+                    comps = _extract_wencai_components(data)
+
                     fund_flow = []
                     dde_flow = []
                     dde_retail_quantity = []
                     concepts = []
                     stock_name = ""
 
-                    for d in _parse_sse_lines(text):
-                        comps = d.get("section", {}).get("result_page", {}).get("components", [])
-                        for comp in comps:
-                            st = comp.get("show_type", "")
-                            data = comp.get("data", {})
-                            cols = [c.get("index_name", "") for c in data.get("columns", [])]
-                            datas = data.get("datas", [])
+                    for comp in comps:
+                        st = comp.get("show_type", "")
+                        comp_data = comp.get("data", {}) if isinstance(comp.get("data"), dict) else {}
+                        raw_cols = comp_data.get("columns", [])
+                        # columns 可能是 list[dict]（含 index_name）或 list[str]
+                        cols = []
+                        for c in raw_cols:
+                            if isinstance(c, dict):
+                                cols.append(c.get("index_name", ""))
+                            elif isinstance(c, str):
+                                cols.append(c)
+                        datas = comp_data.get("datas", [])
 
-                            if st == "barline3" and datas:
-                                if "主力资金" in cols:
-                                    for row in datas:
-                                        fund_flow.append({
-                                            "date": row.get("时间", "") or row.get("时间周期", ""),
-                                            "main_force_net": row.get("主力资金"),
-                                            "volume": row.get("成交量"),
-                                        })
-                                elif "dde散单净流入" in cols:
-                                    for row in datas:
-                                        dde_flow.append({
-                                            "date": row.get("时间", ""),
-                                            "dde_retail_net": row.get("dde散单净流入"),
-                                            "close": row.get("收盘价"),
-                                        })
-                                if "dde散户数量" in cols:
-                                    for row in datas:
-                                        dde_retail_quantity.append({
-                                            "date": row.get("时间", ""),
-                                            "dde_retail_qty": row.get("dde散户数量"),
-                                        })
-
-                            if st == "impressionLabel" and datas:
+                        if st == "barline3" and datas:
+                            if "主力资金" in cols:
                                 for row in datas:
-                                    label = row.get("标签", "")
-                                    cat = row.get("类别", "")
-                                    if cat and label:
-                                        concepts.append({"category": cat, "label": label})
+                                    fund_flow.append({
+                                        "date": row.get("时间", "") or row.get("时间周期", ""),
+                                        "main_force_net": row.get("主力资金"),
+                                        "volume": row.get("成交额") or row.get("成交量"),
+                                    })
+                            elif "dde散单净流入" in cols:
+                                for row in datas:
+                                    dde_flow.append({
+                                        "date": row.get("时间", ""),
+                                        "dde_retail_net": row.get("dde散单净流入"),
+                                        "close": row.get("收盘价") or row.get("股价走势"),
+                                    })
+                            if "dde散户数量" in cols:
+                                for row in datas:
+                                    dde_retail_quantity.append({
+                                        "date": row.get("时间", ""),
+                                        "dde_retail_qty": row.get("dde散户数量"),
+                                    })
 
-                            if st == "kline2" and datas and not stock_name:
-                                stock_name = datas[0].get("股票名称", "")
+                        if st == "impressionLabel" and datas:
+                            for row in datas:
+                                label = row.get("看点", "") or row.get("标签", "")
+                                cat = row.get("类型", "") or row.get("类别", "")
+                                if cat and label:
+                                    concepts.append({"category": cat, "label": label})
+
+                        if st == "kline2" and datas and not stock_name:
+                            stock_name = datas[0].get("股票简称", "") or datas[0].get("股票名称", "")
 
                     result = {
                         "fund_flow": fund_flow,
@@ -1682,10 +2001,7 @@ def fetch_fund_flow_wencai(code: str):
                     }
                     return {"success": True, "data": result, "source": "问财(iwencai)"}
                 finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                    pass  # CDP browser shared - don't close
 
         return asyncio.run(_do_query())
     except ImportError as e:
@@ -1705,40 +2021,29 @@ def fetch_stock_levels(code: str):
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
                 try:
-                    ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = await ctx.new_page()
+                    ctx = browser.contexts[0]
+                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                     await page.set_viewport_size({"width": 1280, "height": 800})
 
-                    # 同时导航和等待 stream-query 响应（替代固定 8s 等待）
-                    async with page.expect_event(
-                        "response",
-                        predicate=lambda r: "stream-query" in r.url,
-                        timeout=20000
-                    ) as event_info:
-                        await page.goto(
-                            f"https://www.iwencai.com/unifiedwap/result?w={code}",
-                            wait_until="domcontentloaded"
-                        )
-                    response = await event_info.value
-                    text = await response.text()
+                    data = await _fetch_wencai_page(page, code)
+                    comps = _extract_wencai_components(data)
+
                     support = None
                     resistance = None
                     stock_name = ""
 
-                    for d in _parse_sse_lines(text):
-                        comps = d.get("section", {}).get("result_page", {}).get("components", [])
-                        for comp in comps:
-                            if comp.get("show_type") != "kline2":
-                                continue
-                            datas = comp.get("data", {}).get("datas", [])
-                            if datas:
-                                stock_name = datas[0].get("股票名称", "")
-                                support = datas[0].get("止盈止损(支撑位)")
-                                resistance = datas[0].get("止盈止损(压力位)")
-                                if isinstance(support, (int, float)):
-                                    support = round(float(support), 2)
-                                if isinstance(resistance, (int, float)):
-                                    resistance = round(float(resistance), 2)
+                    for comp in comps:
+                        if comp.get("show_type") != "kline2":
+                            continue
+                        datas = comp.get("data", {}).get("datas", [])
+                        if datas:
+                            stock_name = datas[0].get("股票简称", "") or datas[0].get("股票名称", "")
+                            support = datas[0].get("止盈止损(支撑位)")
+                            resistance = datas[0].get("止盈止损(压力位)")
+                            if isinstance(support, (int, float)):
+                                support = round(float(support), 2)
+                            if isinstance(resistance, (int, float)):
+                                resistance = round(float(resistance), 2)
 
                     if support is None and resistance is None:
                         return {"success": False, "error": "问财未返回支撑位数据"}
@@ -1752,10 +2057,7 @@ def fetch_stock_levels(code: str):
                         "source": "问财(iwencai)",
                     }
                 finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                    pass  # CDP browser shared - don't close
 
         return asyncio.run(_do_query())
     except ImportError as e:
@@ -1769,8 +2071,7 @@ def fetch_stock_levels(code: str):
 def fetch_wencai_all(code: str):
     """一次问财查询，返回所有可用数据组件
 
-    性能优化: 用 expect_event(stream-query) + domcontentloaded 替代
-    networkidle + 固定8秒等待，耗时从 ~14s 降至 ~4s。
+    适配问财 v2 API (get-robot-data)，兼容旧版 stream-query SSE。
     """
     import asyncio
     try:
@@ -1780,59 +2081,59 @@ def fetch_wencai_all(code: str):
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
                 try:
-                    ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = await ctx.new_page()
+                    ctx = browser.contexts[0]
+                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                     await page.set_viewport_size({"width": 1280, "height": 800})
 
-                    async with page.expect_event(
-                        "response",
-                        predicate=lambda r: "stream-query" in r.url,
-                        timeout=20000
-                    ) as event_info:
-                        await page.goto(
-                            f"https://www.iwencai.com/unifiedwap/result?w={code}",
-                            wait_until="domcontentloaded"
-                        )
-                    response = await event_info.value
-                    text = await response.text()
-                    result = {"fund_flow": [], "levels": {}, "concepts": [], "finance": [], "stock_name": ""}
+                    data = await _fetch_wencai_page(page, code)
+                    comps = _extract_wencai_components(data)
 
-                    for d in _parse_sse_lines(text):
-                        comps = d.get("section", {}).get("result_page", {}).get("components", [])
-                        for comp in comps:
-                            st = comp.get("show_type", "")
-                            data = comp.get("data", {})
-                            cols = [c.get("index_name", "") for c in data.get("columns", [])]
-                            datas = data.get("datas", [])
+                    result = {"fund_flow": [], "dde_retail_quantity": [], "levels": {}, "concepts": [], "finance": [], "stock_name": ""}
 
-                            if st == "barline3" and datas:
-                                if "主力资金" in cols:
-                                    for row in datas:
-                                        result["fund_flow"].append({
-                                            "date": row.get("时间", "") or row.get("时间周期", ""),
-                                            "main_force_net": row.get("主力资金"),
-                                        })
-                            elif st == "kline2" and datas:
-                                r = datas[0]
-                                result["levels"] = {
-                                    "support": r.get("止盈止损(支撑位)"),
-                                    "resistance": r.get("止盈止损(压力位)"),
-                                }
-                                if not result["stock_name"]:
-                                    result["stock_name"] = r.get("股票名称", "")
-                            elif st == "impressionLabel" and datas:
+                    for comp in comps:
+                        st = comp.get("show_type", "")
+                        comp_data = comp.get("data", {}) if isinstance(comp.get("data"), dict) else {}
+                        raw_cols = comp_data.get("columns", [])
+                        # columns 可能是 list[dict]（含 index_name）或 list[str]
+                        cols = []
+                        for c in raw_cols:
+                            if isinstance(c, dict):
+                                cols.append(c.get("index_name", ""))
+                            elif isinstance(c, str):
+                                cols.append(c)
+                        datas = comp_data.get("datas", [])
+
+                        if st == "barline3" and datas:
+                            if "主力资金" in cols:
                                 for row in datas:
-                                    result["concepts"].append({
-                                        "label": row.get("标签", ""),
-                                        "category": row.get("类别", ""),
+                                    result["fund_flow"].append({
+                                        "date": row.get("时间", "") or row.get("时间周期", ""),
+                                        "main_force_net": row.get("主力资金"),
                                     })
+                            if "dde散户数量" in cols:
+                                for row in datas:
+                                    result["dde_retail_quantity"].append({
+                                        "date": row.get("时间", ""),
+                                        "dde_retail_qty": row.get("dde散户数量"),
+                                    })
+                        elif st == "kline2" and datas:
+                            r = datas[0]
+                            result["levels"] = {
+                                "support": r.get("止盈止损(支撑位)"),
+                                "resistance": r.get("止盈止损(压力位)"),
+                            }
+                            if not result["stock_name"]:
+                                result["stock_name"] = r.get("股票简称", "") or r.get("股票名称", "")
+                        elif st == "impressionLabel" and datas:
+                            for row in datas:
+                                result["concepts"].append({
+                                    "label": row.get("看点", "") or row.get("标签", ""),
+                                    "category": row.get("类别", ""),
+                                })
 
                     return {"success": True, "data": result, "source": "问财(iwencai)"}
                 finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                    pass  # CDP browser shared - don't close
 
         return asyncio.run(_do_query())
     except ImportError as e:
@@ -1895,6 +2196,38 @@ def fetch_eps_forecast(code: str):
                             if (rows.length > 0) result.tables.push(rows);
                         }
 
+                        // 提取机构预测明细的调高/调低标记
+                        // <s class="up"> = 调高, <s class="down"> = 调低, <s class=""> = 无变化
+                        const forecastAdjustments = [];
+                        for (const table of tables) {
+                            const headerText = (table.rows[0]?.textContent || '').trim();
+                            if (headerText.includes('机构名称') && headerText.includes('研究员')) {
+                                for (let ri = 2; ri < table.rows.length; ri++) {
+                                    const row = table.rows[ri];
+                                    const cells = row.querySelectorAll('td, th');
+                                    if (cells.length >= 8) {
+                                        const adjustments = [];
+                                        for (let ci = 2; ci < Math.min(8, cells.length); ci++) {
+                                            const s = cells[ci].querySelector('s');
+                                            if (s) {
+                                                if (s.className.includes('up')) adjustments.push('调高');
+                                                else if (s.className.includes('down')) adjustments.push('调低');
+                                                else adjustments.push('不变');
+                                            } else {
+                                                adjustments.push('');
+                                            }
+                                        }
+                                        forecastAdjustments.push({
+                                            institution: cells[0]?.textContent?.trim() || '',
+                                            adjustments: adjustments
+                                        });
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        result.forecastAdjustments = forecastAdjustments;
+
                         // 从 body innerText 提取各 section
                         const bodyText = document.body.innerText;
                         const lines = bodyText.split('\\n');
@@ -1933,6 +2266,92 @@ def fetch_eps_forecast(code: str):
                             }
                         }
                         result.researchText = resLines.join('\\n');
+
+                        // 研报评级分布统计: 找含"买入"/"增持"/"中性"/"减持"/"卖出"且含数字的行
+                        const ratingDist = [];
+                        const ratingRegex = /(买入|增持|中性|减持|卖出)\\s*[（(](\\d+)[)）]/;
+                        for (const line of lines) {
+                            const t = line.trim();
+                            const m = t.match(ratingRegex);
+                            if (m) {
+                                ratingDist.push({rating: m[1], count: parseInt(m[2])});
+                            }
+                        }
+                        result.ratingDistribution = ratingDist;
+
+                        // 评级时间范围: 找"6个月内"或类似
+                        for (const line of lines) {
+                            const t = line.trim();
+                            if (t.includes('个月内') && t.length < 20) {
+                                result.ratingPeriod = t;
+                                break;
+                            }
+                        }
+
+                        // 逐条研报评级: 从 div.profit-forecast-box 提取
+                        // 格式: 评级(买入/增持) + 机构：标题 + 日期 + 摘要
+                        const ratingDetails = [];
+                        const ratingBoxes = document.querySelectorAll('.profit-forecast-box');
+                        for (const box of ratingBoxes) {
+                            const boxText = box.innerText.trim();
+                            const boxLines = boxText.split('\\n').map(l => l.trim()).filter(l => l);
+                            let currentRating = '';
+                            let currentInstitution = '';
+                            let currentTitle = '';
+                            for (let li = 0; li < boxLines.length; li++) {
+                                const t = boxLines[li];
+                                // 评级行: "买      入" / "增      持" 等（含空格）
+                                const cleanRating = t.replace(/\\s+/g, '');
+                                if (cleanRating === '买入' || cleanRating === '增持' || cleanRating === '中性' || cleanRating === '减持' || cleanRating === '卖出') {
+                                    if (currentRating && currentInstitution) {
+                                        ratingDetails.push({rating: currentRating, institution: currentInstitution, title: currentTitle, date: ''});
+                                    }
+                                    currentRating = cleanRating;
+                                    continue;
+                                }
+                                // 机构+标题行: 含"："
+                                if (currentRating && t.includes('：') && !t.startsWith('摘要')) {
+                                    const colonIdx = t.indexOf('：');
+                                    currentInstitution = t.substring(0, colonIdx).trim();
+                                    currentTitle = t.substring(colonIdx + 1).trim().slice(0, 100);
+                                    // 下一行可能是日期
+                                    if (li + 1 < boxLines.length && /^\\d{4}-\\d{2}-\\d{2}/.test(boxLines[li + 1])) {
+                                        ratingDetails.push({rating: currentRating, institution: currentInstitution, title: currentTitle, date: boxLines[li + 1].substring(0, 10)});
+                                        currentRating = '';
+                                        currentInstitution = '';
+                                        currentTitle = '';
+                                    }
+                                }
+                            }
+                            // 处理最后一条
+                            if (currentRating && currentInstitution) {
+                                ratingDetails.push({rating: currentRating, institution: currentInstitution, title: currentTitle, date: ''});
+                            }
+                        }
+                        result.ratingDetails = ratingDetails;
+
+                        // 各指标机构明细+评级 (hidden tables: 研究机构/研究员/预测值/评级)
+                        const indicatorRatings = [];
+                        for (let ti = 0; ti < tables.length; ti++) {
+                            const table = tables[ti];
+                            if (!table || table.length < 2) continue;
+                            const header = (table[0] || []).join(' ');
+                            if (header.includes('研究机构') && header.includes('评级')) {
+                                for (let ri = 1; ri < table.length; ri++) {
+                                    const row = table[ri];
+                                    if (row.length >= 4) {
+                                        indicatorRatings.push({
+                                            institution: row[0],
+                                            analyst: row[1],
+                                            value: row[2],
+                                            rating: row[3],
+                                        });
+                                    }
+                                }
+                                break; // 只取第一个（营收的机构明细）
+                            }
+                        }
+                        result.indicatorRatings = indicatorRatings;
 
                         return result;
                     }""")
@@ -1982,6 +2401,9 @@ def fetch_eps_forecast(code: str):
 
                     # --- Table #2: 机构预测明细 ---
                     # 表头含 "机构名称" 和 "研究员"，跳过前2行表头(列名+子列名)
+                    # 同时合并调高/调低标记（来自 forecastAdjustments）
+                    forecast_adjustments = raw.get("forecastAdjustments", [])
+                    adj_map = {a["institution"]: a["adjustments"] for a in forecast_adjustments}
                     institution_forecasts = []
                     for table in tables:
                         if not table or len(table) < 3:
@@ -1991,8 +2413,10 @@ def fetch_eps_forecast(code: str):
                             continue
                         for row in table[2:]:
                             if len(row) >= 8:
-                                institution_forecasts.append({
-                                    "institution": row[0],
+                                inst = row[0]
+                                adj = adj_map.get(inst, [])
+                                entry = {
+                                    "institution": inst,
                                     "analyst": row[1],
                                     "eps_2026E": row[2],
                                     "eps_2027E": row[3],
@@ -2001,7 +2425,16 @@ def fetch_eps_forecast(code: str):
                                     "np_2027E": row[6],
                                     "np_2028E": row[7],
                                     "report_date": row[8] if len(row) > 8 else "",
-                                })
+                                }
+                                # 合并调高/调低标记（6个值：EPS×3 + NP×3）
+                                if len(adj) >= 6:
+                                    entry["eps_2026E_adj"] = adj[0]
+                                    entry["eps_2027E_adj"] = adj[1]
+                                    entry["eps_2028E_adj"] = adj[2]
+                                    entry["np_2026E_adj"] = adj[3]
+                                    entry["np_2027E_adj"] = adj[4]
+                                    entry["np_2028E_adj"] = adj[5]
+                                institution_forecasts.append(entry)
                         break
 
                     # --- 详细指标预测 (text multi-line merging) ---
@@ -2055,6 +2488,16 @@ def fetch_eps_forecast(code: str):
                         if l.startswith("摘要"):
                             research_summaries.append(l[:300])
 
+                    # --- 评级分布统计 ---
+                    rating_distribution = raw.get("ratingDistribution", [])
+                    rating_period = raw.get("ratingPeriod", "")
+
+                    # --- 逐条研报评级 ---
+                    rating_details = raw.get("ratingDetails", [])
+
+                    # --- 各指标机构明细+评级 ---
+                    indicator_ratings = raw.get("indicatorRatings", [])
+
                     result = {
                         "code": code,
                         "stock_name": stock_name,
@@ -2065,6 +2508,10 @@ def fetch_eps_forecast(code: str):
                         "institution_forecasts": institution_forecasts,
                         "indicators": indicators,
                         "research_summaries": research_summaries,
+                        "rating_distribution": rating_distribution,
+                        "rating_period": rating_period,
+                        "rating_details": rating_details,
+                        "indicator_ratings": indicator_ratings,
                     }
 
                     return {
@@ -2085,6 +2532,98 @@ def fetch_eps_forecast(code: str):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+# ── fetch_executive_changes: 高管持股变动（东方财富 gdggcg）──
+@cached(ttl=3600)
+def fetch_executive_changes(code: str):
+    """
+    通过 playwright 访问东方财富股东高管持股页面，提取:
+    1. 高管持股变动明细（日期/变动人/变动方向/变动股数/成交均价/变动金额/变动原因/变动比例/变动后持股/职务等）
+    默认页面显示最近 40 条变动记录
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 800})
+                await page.goto(
+                    f"https://data.eastmoney.com/gdggcg/ggdetail/{code}.html",
+                    wait_until="domcontentloaded", timeout=20000
+                )
+                await page.wait_for_timeout(5000)
+
+                result = await page.evaluate("""() => {
+                    const tables = document.querySelectorAll('table');
+                    let targetTable = null;
+                    for (const t of tables) {
+                        const headerText = (t.rows[0]?.textContent || '') + (t.rows[1]?.textContent || '');
+                        if (t.rows.length >= 2 && headerText.includes('变动人')) {
+                            targetTable = t;
+                            break;
+                        }
+                    }
+                    if (!targetTable) return { changes: [], totalCount: 0, noData: false };
+
+                    // 检查是否"暂无数据"
+                    const bodyText = targetTable.textContent || '';
+                    if (bodyText.includes('暂无数据') || bodyText.includes('暂无记录')) {
+                        return { changes: [], totalCount: 0, noData: true };
+                    }
+
+                    const headerCells = Array.from(targetTable.rows[0].querySelectorAll('th, td'));
+                    const headers = headerCells.map(c => c.textContent.trim().replace(/\\s+/g, ''));
+
+                    const changes = [];
+                    for (let i = 1; i < targetTable.rows.length; i++) {
+                        const cells = Array.from(targetTable.rows[i].querySelectorAll('td')).map(c => c.textContent.trim());
+                        if (cells.length < 5) continue;
+                        const entry = {};
+                        for (let j = 0; j < headers.length && j < cells.length; j++) {
+                            entry[headers[j]] = cells[j];
+                        }
+                        if (entry['日期'] || entry['变动人']) {
+                            changes.push(entry);
+                        }
+                    }
+                    return { changes: changes, totalCount: changes.length, noData: false };
+                }""")
+
+                changes = result.get("changes", [])
+                no_data = result.get("noData", False)
+                if not changes:
+                    if no_data:
+                        return {"success": True, "data": {"code": code, "changes": [], "totalCount": 0, "noData": True}, "source": "东方财富"}
+                    return {"success": False, "error": f"gdggcg 页面无 {code} 高管持股变动数据"}
+
+                return {
+                    "success": True,
+                    "data": {
+                        "code": code,
+                        "changes": changes,
+                        "totalCount": result.get("totalCount", len(changes)),
+                    },
+                    "source": "东方财富",
+                }
+
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 # ── API 路由表 ──
 ROUTES = {
     "/api/fund-flow":            ("个股资金流+概念(问财)",   fetch_fund_flow_wencai, ["code"]),
@@ -2101,6 +2640,7 @@ ROUTES = {
     "/api/stock-levels":         ("支撑位/压力位(问财)",     fetch_stock_levels, ["code"]),
     "/api/wencai-all":           ("问财全数据(问财)",        fetch_wencai_all, ["code"]),
     "/api/eps-forecast":         ("EPS一致预期(同花顺F10)",  fetch_eps_forecast, ["code"]),
+    "/api/executive-changes":    ("高管持股变动(东方财富)",  fetch_executive_changes, ["code"]),
 }
 
 

@@ -11,10 +11,15 @@ from tradingagents.agents.utils.agent_utils import (
     get_limit_up_pool,
     get_news,
     get_northbound_flow,
+    get_stock_holder,
     get_stock_kline_full,
     get_stock_position,
+    retry_report_generation,
 )
 from tradingagents.dataflows.config import get_config
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_hot_money_tracker(llm):
@@ -35,6 +40,7 @@ def create_hot_money_tracker(llm):
             get_dragon_tiger_board,
             get_industry_comparison,
             get_stock_position,
+            get_stock_holder,
             get_limit_up_pool,
         ]
 
@@ -48,7 +54,7 @@ def create_hot_money_tracker(llm):
             "\n- **大股东/机构行为**：大股东增减持、机构调研频次变化、定增/配股等融资行为反映内部人态度"
             "\n\n分析方法："
             "\n1. 先调用 get_stock_kline_full(code, days) 获取近期 K 线和成交量数据（含换手率），识别量价异动"
-            "\n2. 调用 get_insider_transactions 获取股东/内部人交易记录，判断主力动向"
+            "\n2. 调用 get_stock_holder 获取股东人数变化和前十大流通股东变动，判断主力筹码动向；调用 get_stock_position 获取机构持股明细；调用 get_insider_transactions 获取高管/大股东增减持明细，判断内部人交易动向"
             "\n3. 调用 get_news 搜索游资、龙虎榜、主力资金相关新闻"
             "\n4. 调用 get_hot_stocks 获取当日强势股及题材归因（同花顺编辑部人工标注），识别热点板块轮动"
             "\n5. 调用 get_northbound_flow 获取北向资金流向（注意：交易所自2024年起停止发布北向实时净买入数据，工具会返回「已停止发布」提示和南向资金数据作为参考）"
@@ -56,7 +62,8 @@ def create_hot_money_tracker(llm):
             "\n\n请使用以下工具："
             "\n- `get_stock_kline_full(code, days)`：获取 K 线和成交量数据（含换手率/涨跌幅）"
             "\n- `get_news(ticker, start_date, end_date)`：搜索游资/资金流向相关新闻，ticker 必须使用目标股票的 6 位代码"
-            "\n- `get_insider_transactions`：获取股东和内部人交易数据"
+            "\n- `get_insider_transactions(ticker)`：获取高管/大股东增减持明细（东方财富，含日期/变动人/变动方向/变动股数/成交均价/变动金额/变动原因/变动比例/职务），判断内部人交易动向"
+            "\n- `get_stock_holder(ticker)`：获取股东研究数据（10期股东人数时序含人均流通股/人均持股金额、5期前十大流通股东含变动比例、退出前十大股东、同业对比），判断筹码集中度和主力动向"
             "\n- `get_hot_stocks(curr_date)`：获取当日涨停股 + 题材归因 reason tags（同花顺独家）"
             "\n- `get_northbound_flow(curr_date)`：获取北向资金流向（⚠️ 交易所自2024年起停止发布北向实时净买入数据，返回「已停止发布」提示+南向资金数据作为参考）"
             "\n- `get_concept_blocks(ticker)`：获取个股所属概念板块列表（同花顺问财，精确到个股概念归属）"
@@ -105,7 +112,17 @@ def create_hot_money_tracker(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = result.content if result.content else ""
+            if not report.strip():
+                report = retry_report_generation(
+                    llm, state["messages"], result, "hot_money_analyst"
+                )
+        else:
+            # LLM may return both tool_calls and content simultaneously.
+            # Keep the content as a candidate report so it's not lost.
+            report = result.content if result.content else ""
+            tool_names = [tc.get("name", "?") for tc in result.tool_calls]
+            logger.info("hot_money_analyst: tool_calls=%s", tool_names)
 
         return {
             "messages": [result],

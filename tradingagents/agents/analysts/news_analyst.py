@@ -4,8 +4,12 @@ from tradingagents.agents.utils.agent_utils import (
     get_global_news,
     get_language_instruction,
     get_news,
+    retry_report_generation,
 )
 from tradingagents.dataflows.config import get_config
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_news_analyst(llm):
@@ -66,7 +70,17 @@ def create_news_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = result.content if result.content else ""
+            if not report.strip():
+                report = retry_report_generation(
+                    llm, state["messages"], result, "news_analyst"
+                )
+        else:
+            # LLM may return both tool_calls and content simultaneously.
+            # Keep the content as a candidate report so it's not lost.
+            report = result.content if result.content else ""
+            tool_names = [tc.get("name", "?") for tc in result.tool_calls]
+            logger.info("news_analyst: tool_calls=%s", tool_names)
 
         return {
             "messages": [result],

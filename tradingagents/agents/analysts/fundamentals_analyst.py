@@ -10,11 +10,16 @@ from tradingagents.agents.utils.agent_utils import (
     get_insider_transactions,
     get_language_instruction,
     get_profit_forecast,
+    get_stock_holder,
     get_stock_homepage,
     get_stock_industry_peers,
     verify_stock_valuation,
+    retry_report_generation,
 )
 from tradingagents.dataflows.config import get_config
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_fundamentals_analyst(llm):
@@ -33,6 +38,7 @@ def create_fundamentals_analyst(llm):
             get_stock_homepage,
             get_stock_industry_peers,
             get_insider_transactions,
+            get_stock_holder,
             verify_stock_valuation,
         ]
 
@@ -46,7 +52,7 @@ def create_fundamentals_analyst(llm):
             "\n- **特殊风险关注**：商誉减值（并购后遗症）、股权质押比例、大股东减持计划、关联交易规模。"
             "\n\n请使用以下工具获取数据："
             "\n- `get_fundamentals`：获取实时估值数据（PE/PB/总市值/流通市值/换手率等，来源：腾讯行情API）"
-            "\n- `get_profit_forecast`：获取机构一致预期EPS详情（同花顺F10，含机构预测、EPS区间、前向PE、PEG、PE消化时间）"
+            "\n- `get_profit_forecast`：获取机构一致预期详情（同花顺F10，含EPS/净利润一致预期+调高调低标记+机构预测明细+详细指标预测12项×6年+前向PE/PEG/PE消化时间+机构评级分布+逐条研报评级+机构观点摘要）"
             "\n- `get_balance_sheet`：资产负债表详细数据"
             "\n- `get_cashflow`：现金流量表详细数据"
             "\n- `get_income_statement`：利润表详细数据"
@@ -54,7 +60,8 @@ def create_fundamentals_analyst(llm):
             "\n- `get_financial_quarterly(ticker)`：获取最近4期财务数据（营收/净利润/扣非净利润同比增长率、ROE、毛利率、净利率、资产负债率、每股收益、每股经营现金流等）-- 必采用途：营收同比增长率、归母净利润同比增长率、ROE、资产负债率、经营现金流/净利润比"
             "\n- `get_stock_homepage(ticker)`：获取综合概要（PE动态/静态、PB、总市值、质押比例、大盘/小盘分类）-- 必采用途：PE(TTM)、PB、总市值、股权质押比例"
             "\n- `get_stock_industry_peers(ticker)`：获取同行业公司财务指标对标（行业排名、同行每股收益/ROE/毛利率对比）"
-            "\n- `get_insider_transactions(ticker)`：获取大股东/内部人交易记录和持股变化，用于评估减持风险"
+            "\n- `get_insider_transactions(ticker)`：获取高管/大股东增减持明细（东方财富，含日期/变动人/变动方向/变动股数/成交均价/变动金额/变动原因/变动比例/变动后持股/职务），用于评估内部人减持风险"
+            "\n- `get_stock_holder(ticker)`：获取股东研究数据（10期股东人数时序含人均流通股/人均持股金额、5期前十大流通股东含变动比例、5期前十大股东、退出前十大股东、同业对比），用于评估筹码集中度和股东变动"
             "\n- `verify_stock_valuation(code)`：使用精确十进制（Decimal）验算PE/PB/ROE，避免LLM心算浮点误差。自动从同花顺F10取数后验算"
             "\n\n撰写详尽的基本面研究报告，给出具体数据支撑的分析结论（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总关键财务指标和估值水平。"
             "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
@@ -64,7 +71,7 @@ def create_fundamentals_analyst(llm):
             "\n4. ROE"
             "\n5. 资产负债率"
             "\n6. 经营性现金流与净利润比值"
-            "\n7. 机构一致预期 EPS（调用 get_profit_forecast 获取）"
+            "\n7. 机构一致预期 EPS + 机构评级分布 + 研报评级明细（调用 get_profit_forecast 获取）"
             + get_language_instruction()
         )
 
@@ -97,7 +104,17 @@ def create_fundamentals_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = result.content if result.content else ""
+            if not report.strip():
+                report = retry_report_generation(
+                    llm, state["messages"], result, "fundamentals_analyst"
+                )
+        else:
+            # LLM may return both tool_calls and content simultaneously.
+            # Keep the content as a candidate report so it's not lost.
+            report = result.content if result.content else ""
+            tool_names = [tc.get("name", "?") for tc in result.tool_calls]
+            logger.info("fundamentals_analyst: tool_calls=%s", tool_names)
 
         return {
             "messages": [result],

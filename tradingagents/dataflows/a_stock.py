@@ -243,12 +243,13 @@ def _tencent_quote(codes: list[str]) -> dict[str, dict]:
             "low": float(vals[34]) if vals[34] else 0,
             "turnover_pct": float(vals[38]) if vals[38] else 0,
             "pe_ttm": float(vals[39]) if vals[39] else 0,
-            "mcap_yi": float(vals[44]) if vals[44] else 0,
-            "float_mcap_yi": float(vals[45]) if vals[45] else 0,
+            "mcap_yi": float(vals[45]) if vals[45] else 0,
+            "float_mcap_yi": float(vals[44]) if vals[44] else 0,
             "pb": float(vals[46]) if vals[46] else 0,
             "limit_up": float(vals[47]) if vals[47] else 0,
             "limit_down": float(vals[48]) if vals[48] else 0,
-            "pe_static": float(vals[52]) if vals[52] else 0,
+            "pe_dynamic": float(vals[52]) if vals[52] else 0,
+            "pe_static": float(vals[53]) if vals[53] else 0,
         }
     return result
 
@@ -351,6 +352,62 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
             return df
     # Fallback: return first table if exists
     return dfs[0] if dfs else pd.DataFrame()
+
+
+def _eps_forecast_playwright(code: str):
+    """Fetch consensus EPS forecast via playwright_service (同花顺F10 CDP).
+
+    Returns (eps_by_year, display_lines) or (None, None) on failure.
+    eps_by_year: {year_str: mean_eps_float}
+    display_lines: list[str] for get_fundamentals output.
+    """
+    try:
+        from playwright_service.client import PlaywrightClient
+        client = PlaywrightClient()
+        result = client.eps_forecast(code)
+    except Exception as e:
+        logger.warning("playwright eps_forecast transport failed for %s: %s", code, str(e)[:200])
+        return None, None
+
+    if not result or not result.get("success"):
+        return None, None
+
+    data = result.get("data", {}) or {}
+    eps_summary = data.get("eps_summary", []) or []
+    if not eps_summary:
+        return None, None
+
+    eps_by_year = {}
+    display_lines = ["\n--- Consensus EPS Forecast (同花顺F10 playwright) ---"]
+    ic = data.get("institution_count")
+    if ic:
+        display_lines.append(f"覆盖机构数: {ic} 家")
+
+    for r in eps_summary:
+        year = str(r.get("year", ""))
+        avg_val = r.get("avg")
+        min_val = r.get("min", "N/A")
+        max_val = r.get("max", "N/A")
+        count_val = r.get("institution_count", 0)
+        try:
+            mean_eps = float(avg_val)
+        except (ValueError, TypeError):
+            mean_eps = 0
+        try:
+            count = int(count_val)
+        except (ValueError, TypeError):
+            count = 0
+        display_lines.append(
+            f"FY{year}: EPS={mean_eps} (range {min_val}~{max_val}, {count} analysts)"
+        )
+        if count < 3:
+            display_lines.append("  Warning: low coverage (<3 analysts)")
+        if year:
+            eps_by_year[year] = mean_eps
+
+    if not eps_by_year:
+        return None, None
+    return eps_by_year, display_lines
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +580,7 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
         df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
         df = _normalize_ohlcv_dates(df)
     except Exception as e:
-        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
+        logger.debug("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, str(e)[:100])
         # Fallback: Sina direct HTTP API
         try:
             df = _sina_kline_fallback(code)
@@ -727,11 +784,13 @@ def get_fundamentals(
             tq = _tencent_quote([code])
             if code in tq:
                 q = tq[code]
+                lines.append("\n=== 当前估值（实时，基于已披露财报） ===")
                 lines.extend(
                     [
                         f"Name: {q['name']}",
                         f"Price: {q['price']}",
                         f"PE (TTM): {q['pe_ttm']}",
+                        f"PE (Dynamic): {q['pe_dynamic']}",
                         f"PE (Static): {q['pe_static']}",
                         f"PB: {q['pb']}",
                         f"Market Cap (100M CNY): {q['mcap_yi']}",
@@ -742,6 +801,17 @@ def get_fundamentals(
                         f"Limit Down: {q['limit_down']}",
                     ]
                 )
+                # 涨跌停状态判断（涨停价已四舍五入到分，不能用涨幅==10%判断）
+                try:
+                    _price = float(q['price'])
+                    _lu = float(q['limit_up'])
+                    _ld = float(q['limit_down'])
+                    if _price > 0 and _lu > 0 and abs(_price - _lu) < 0.001:
+                        lines.append(f"⚠️ 已涨停 (price={_price} == limit_up={_lu})")
+                    elif _price > 0 and _ld > 0 and abs(_price - _ld) < 0.001:
+                        lines.append(f"⚠️ 已跌停 (price={_price} == limit_down={_ld})")
+                except (ValueError, TypeError):
+                    pass
         except Exception as e:
             logger.warning("Tencent quote failed for %s: %s", code, e)
 
@@ -797,35 +867,42 @@ def get_fundamentals(
                 if d.get("f189"):
                     lines.append(f"上市日期: {d['f189']}")
         except Exception as e:
-            logger.warning("eastmoney push2 stock info failed for %s: %s", code, e)
+            logger.warning("eastmoney push2 stock info failed for %s: %s", code, str(e)[:200])
 
-        # --- 同花顺 direct HTTP: consensus EPS forecast ---
+        # --- 同花顺 consensus EPS forecast (playwright preferred, direct HTTP fallback) ---
         try:
-            forecast_df = _ths_eps_forecast(code)
-            if forecast_df is not None and not forecast_df.empty:
-                lines.append("\n--- Consensus EPS Forecast (同花顺) ---")
+            eps_by_year, eps_lines = _eps_forecast_playwright(code)
+            if eps_by_year is None:
+                # Fallback: direct HTTP (lightweight, often blocked by anti-crawl)
+                forecast_df = _ths_eps_forecast(code)
                 eps_by_year = {}
-                for _, row in forecast_df.iterrows():
-                    year = str(row.iloc[0]) if len(row) > 0 else ""
-                    mean_eps_val = row.iloc[3] if len(row) > 3 else 0
-                    count_val = row.iloc[1] if len(row) > 1 else 0
-                    min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
-                    max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
-                    try:
-                        mean_eps = float(mean_eps_val)
-                    except (ValueError, TypeError):
-                        mean_eps = 0
-                    try:
-                        count = int(count_val)
-                    except (ValueError, TypeError):
-                        count = 0
-                    lines.append(
-                        f"FY{year}: EPS={mean_eps} "
-                        f"(range {min_eps_val}~{max_eps_val}, {count} analysts)"
-                    )
-                    if count < 3:
-                        lines.append("  Warning: low coverage (<3 analysts)")
-                    eps_by_year[year] = mean_eps
+                eps_lines = ["\n--- Consensus EPS Forecast (同花顺) ---"]
+                if forecast_df is not None and not forecast_df.empty:
+                    for _, row in forecast_df.iterrows():
+                        year = str(row.iloc[0]) if len(row) > 0 else ""
+                        mean_eps_val = row.iloc[3] if len(row) > 3 else 0
+                        count_val = row.iloc[1] if len(row) > 1 else 0
+                        min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
+                        max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
+                        try:
+                            mean_eps = float(mean_eps_val)
+                        except (ValueError, TypeError):
+                            mean_eps = 0
+                        try:
+                            count = int(count_val)
+                        except (ValueError, TypeError):
+                            count = 0
+                        eps_lines.append(
+                            f"FY{year}: EPS={mean_eps} "
+                            f"(range {min_eps_val}~{max_eps_val}, {count} analysts)"
+                        )
+                        if count < 3:
+                            eps_lines.append("  Warning: low coverage (<3 analysts)")
+                        eps_by_year[year] = mean_eps
+
+            if eps_by_year:
+                lines.append("\n=== 预期估值（前瞻，基于机构一致预测EPS） ===")
+                lines.extend(eps_lines)
 
                 # Forward PE / PEG / PE digestion
                 try:
@@ -837,7 +914,7 @@ def get_fundamentals(
                             eps_cur = eps_by_year[years_sorted[0]]
                             fwd_pe = price / eps_cur
                             lines.append(
-                                f"\nForward PE (FY{years_sorted[0]}): "
+                                f"Forward PE (FY{years_sorted[0]}): "
                                 f"{fwd_pe:.1f}x (price={price}, EPS={eps_cur})"
                             )
                             if (
@@ -869,7 +946,7 @@ def get_fundamentals(
                 except Exception as e:
                     logger.warning("Forward PE calc failed for %s: %s", code, e)
         except Exception as e:
-            logger.warning("Consensus EPS forecast failed for %s: %s", code, e)
+            logger.warning("Consensus EPS forecast failed for %s: %s", code, str(e)[:200])
 
         if not lines:
             return f"No fundamentals data found for A-stock '{code}'"
@@ -1231,7 +1308,7 @@ def get_global_news(
                 "source": "CLS Wire",
             })
     except Exception as e:
-        logger.warning("CLS news fetch failed: %s", e)
+        logger.warning("CLS news fetch failed: %s", str(e)[:200])
 
     # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
     try:
@@ -1295,47 +1372,87 @@ def get_global_news(
 def get_insider_transactions(
     ticker: Annotated[str, "A-stock code"],
 ) -> str:
-    """Get shareholder/insider activity via mootdx F10.
-
-    Note: A-stock insider transaction data differs from US markets.
-    Uses mootdx F10 shareholder research as the closest equivalent.
-    """
+    """Get insider/executive trading changes via 东方财富 gdggcg (playwright)."""
     code = _normalize_ticker(ticker)
 
+    # --- playwright: 东方财富 高管持股变动 ---
     try:
-        client = _get_mootdx_client()
-        text = client.F10(symbol=code, name="股东研究")
+        result = _executive_changes_playwright(code)
+        if result is not None:
+            return result
+    except Exception as e:
+        logger.warning("playwright executive_changes failed for %s: %s", code, str(e)[:200])
 
-        if not text or not text.strip():
-            return f"No insider/shareholder data found for A-stock '{code}'"
+    return f"[高管持股变动] {code}: playwright_service 不可用，无法获取高管/大股东增减持明细。请确保 playwright_service 已启动。"
 
-        header = f"# Shareholder Research for {code} (A-stock)\n"
-        header += "# Note: A-stock equivalent of insider transactions\n"
-        header += "# Data source: mootdx F10\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+def _executive_changes_playwright(code: str):
+    """Fetch executive/insider trading changes via playwright_service.
+
+    Returns rendered string, or None on failure (caller falls back to mootdx).
+    """
+    try:
+        from playwright_service.client import PlaywrightClient
+        client = PlaywrightClient()
+        result = client.executive_changes(code)
+    except Exception as e:
+        logger.warning("playwright executive_changes transport failed for %s: %s", code, str(e)[:200])
+        return None
+
+    if not result or not result.get("success"):
+        return None
+
+    data = result.get("data", {}) or {}
+    changes = data.get("changes", []) or []
+    if not changes:
+        # 区分"确实无数据"和"接口失败"
+        if data.get("noData"):
+            return (
+                f"# 高管持股变动: {code}\n"
+                f"# 数据源: 东方财富 (gdggcg)\n"
+                f"# 该股票无高管/大股东增减持记录\n\n"
+                f"（东方财富页面显示「暂无数据」，表明该股票历史上无高管增减持公告记录）"
+            )
+        return None
+
+    lines = [
+        f"# 高管持股变动: {code}",
+        f"# 数据源: 东方财富 (gdggcg)",
+        f"# 获取时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# 共 {data.get('totalCount', len(changes))} 条变动记录",
+        "",
+    ]
+
+    # 汇总：增持/减持统计
+    increases = [c for c in changes if "增持" in c.get("变动方向", "")]
+    decreases = [c for c in changes if "减持" in c.get("变动方向", "")]
+    lines.append(f"## 变动汇总: 增持 {len(increases)} 次, 减持 {len(decreases)} 次")
+
+    # 明细表
+    lines.append(f"\n## 持股变动明细 ({len(changes)} 条)")
+    lines.append(
+        f"  {'日期':<12} {'变动人':<10} {'方向':<6} {'变动股数':<14} "
+        f"{'均价':<8} {'变动金额':<12} {'变动原因':<12} {'职务':<16}"
+    )
+    lines.append("  " + "-" * 100)
+    for c in changes[:30]:
+        date = c.get("日期", "")[:10]
+        person = c.get("变动人", "")[:8]
+        direction = c.get("变动方向", "")[:4]
+        shares = c.get("变动股数（股）", c.get("变动股数", ""))[:12]
+        price = c.get("成交均价", "")[:6]
+        amount = c.get("变动金额(元)", c.get("变动金额", ""))[:10]
+        reason = c.get("变动原因", "")[:10]
+        position = c.get("职务", "")[:14]
+        lines.append(
+            f"  {date:<12} {person:<10} {direction:<6} {shares:<14} "
+            f"{price:<8} {amount:<12} {reason:<12} {position:<16}"
         )
 
-        import re
+    if len(changes) > 30:
+        lines.append(f"  ... (共 {len(changes)} 条，仅显示前 30 条)")
 
-        sec4_hits = list(re.finditer(r"\r?\n【4\.股东变化】\r?\n", text))
-        if sec4_hits:
-            sec4_pos = sec4_hits[-1].start()
-            before_sec4 = text[:sec4_pos]
-            sec4_text = text[sec4_pos:]
-            cut_at = 2000
-            if len(sec4_text) > cut_at:
-                sec4_text = (
-                    sec4_text[:cut_at]
-                    + "\n\n(... older shareholder history omitted, "
-                    f"{len(text) - sec4_pos - cut_at} chars truncated ...)"
-                )
-            text = before_sec4 + sec4_text
-
-        return header + text
-
-    except Exception as e:
-        return f"Error retrieving insider/shareholder data for {code}: {str(e)}"
+    return "\n".join(lines)
 
 
 # ---- 10. get_profit_forecast ----

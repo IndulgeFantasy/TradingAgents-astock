@@ -66,12 +66,14 @@ def get_insider_transactions(
     ticker: Annotated[str, "6-digit A-stock code (e.g. 600379). Must be numeric, NOT company name"],
 ) -> str:
     """
-    Retrieve insider transaction information about a company.
-    Uses the configured news_data vendor.
+    Retrieve executive/insider trading changes (高管/大股东增减持明细).
+    Data source: 东方财富 gdggcg, via playwright_service.
+    Returns change records with date, changer, direction (增持/减持), shares,
+    price, amount, reason, ratio, post-change holdings, and position.
     Args:
         ticker (str): 6-digit A-stock code, e.g. 600379
     Returns:
-        str: A report of insider transaction data
+        str: A report of executive/insider trading changes
     """
     ok, code_or_message = _validate_a_stock_code("get_insider_transactions", ticker)
     if not ok:
