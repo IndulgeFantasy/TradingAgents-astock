@@ -13,14 +13,6 @@ from tradingagents.agents.utils.structured import (
     invoke_structured_or_freetext,
 )
 
-# The schema alone cannot stop the model from putting price levels into the
-# free-text reasoning field, so the prompt says it explicitly too.
-_NO_LEVELS_INSTRUCTION = (
-    "Explain the reasoning behind the direction. Do NOT state entry prices, "
-    "stop-loss levels, target prices or position sizes for this security."
-)
-
-
 def create_trader(llm):
     structured_llm = bind_structured(llm, TraderProposal, "Trader")
 
@@ -64,7 +56,7 @@ def create_trader(llm):
                     "09:30-11:30 / 13:00-14:57, closing auction 14:57-15:00, after-hours "
                     "fixed-price session 15:05-15:30 (all A-shares since 2026-07-06)\n"
                     "Anchor your reasoning in the analysts' reports and the research plan. "
-                    f"{_NO_LEVELS_INSTRUCTION} "
+                    "Be specific about entry price, stop loss, and position sizing. "
                     "（以上参数仅供技术研究参考，不构成投资建议）"
                 ),
             },

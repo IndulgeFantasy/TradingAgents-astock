@@ -378,16 +378,16 @@ def verify_stock_valuation(
         except Exception as e:
             logger.warning("Tencent quote failed in verify_stock_valuation for %s: %s", code, str(e)[:200])
 
-        # Fallback 1: 东财 push2his 最新 K 线收盘价（精度到分）
+        # Fallback 1: playwright_service 最新 K 线收盘价（浏览器通道，规避东财 push2his 直连风控）
         if price is None:
             try:
-                from tradingagents.dataflows.a_stock import _em_fetch_klines
-                klines = _em_fetch_klines(code, count=1)
-                if klines:
-                    price = klines[-1].get("close")
-                    price_source = "东财push2his(最新收盘价)"
+                from tradingagents.agents.utils.playwright_tools import _get_client
+                res = _get_client().stock_kline_full(code, 5)
+                if res.get("success") and res.get("data"):
+                    price = res["data"][-1].get("close")
+                    price_source = "东财行情(playwright最新收盘价)"
             except Exception as e:
-                logger.warning("Eastmoney kline fallback failed for %s: %s", code, str(e)[:200])
+                logger.warning("Playwright kline fallback failed for %s: %s", code, str(e)[:200])
 
         # Fallback 2: derive price from market_cap / shares (least precise, both in 亿)
         if price is None and mcap_yi and ts and ts > 0:

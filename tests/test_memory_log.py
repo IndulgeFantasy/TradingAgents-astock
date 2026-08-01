@@ -588,22 +588,31 @@ class TestDeferredReflection:
     def test_fetch_returns_delisted(self):
         """Empty K-line list -> returns (None, None, None), no crash."""
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
-            mock_fetch.return_value = []
+        with patch("tradingagents.agents.utils.playwright_tools._get_client") as mock_get_client:
+            fake = MagicMock()
+            fake.stock_kline_full.return_value = {"success": False, "error": "无数据"}
+            mock_get_client.return_value = fake
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "XXXXXFAKE", "2026-01-10")
         assert raw is None and alpha is None and days is None
 
     def test_fetch_returns_benchmark_shorter_than_stock(self):
-        """Benchmark having fewer rows than the stock must not raise IndexError."""
+        """Benchmark having fewer rows than the stock: graceful partial holding period."""
         stock_prices = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
         bench_prices = [4000.0, 4020.0, 4030.0]
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
-            def _fetch(code, count=250):
-                return _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices)
-            mock_fetch.side_effect = _fetch
+        with patch("tradingagents.agents.utils.playwright_tools._get_client") as mock_get_client:
+            fake = MagicMock()
+            fake.stock_kline_full.side_effect = lambda code, days: {
+                "success": True,
+                "data": _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices),
+            }
+            mock_get_client.return_value = fake
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "688017", "2026-01-05")
-        assert raw is None and alpha is None and days is None
+        # 宽容模式: 基准仅 3 条 -> actual_days = min(5, 5, 2) = 2，返回部分持有期而非崩溃
+        assert raw is not None and alpha is not None
+        assert days == 2
+        assert abs(raw - 0.04) < 1e-9      # (104-100)/100
+        assert abs(alpha - 0.0325) < 1e-9  # 4% - 0.75%
 
     # TradingAgentsGraph._resolve_pending_entries
 
@@ -686,6 +695,7 @@ class TestPortfolioManagerInjection:
             rating=PortfolioRating.OVERWEIGHT,
             executive_summary="Build position gradually over the next two weeks.",
             investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
+            price_target=215.0,
             time_horizon="3-6 months",
         )
         llm = _structured_pm_llm(captured, decision)
@@ -695,8 +705,7 @@ class TestPortfolioManagerInjection:
         assert "**Rating**: Overweight" in md
         assert "**Executive Summary**: Build position gradually" in md
         assert "**Investment Thesis**: AI capex cycle" in md
-        # 框架不产出目标价——渲染里永远不该出现这一节。
-        assert "Price Target" not in md
+        assert "**Price Target**: 215.0" in md
         assert "**Time Horizon**: 3-6 months" in md
 
     def test_pm_falls_back_to_freetext_when_structured_unavailable(self):

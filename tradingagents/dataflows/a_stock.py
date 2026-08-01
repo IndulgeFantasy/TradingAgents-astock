@@ -2502,7 +2502,13 @@ def get_astock_chip_distribution(
     lines = [f"# 筹码分布 | {code}"]
 
     try:
-        klines = _em_fetch_klines(code)
+        # 数据源: playwright_service 浏览器通道（规避东财 push2his 直连风控）。
+        # records 含 date/open/close/high/low/volume/turnover，与 _compute_cyq 所需字段一致。
+        from tradingagents.agents.utils.playwright_tools import _get_client
+        res = _get_client().stock_kline_full(code, _CYQ_KLINE_COUNT)
+        if not res.get("success"):
+            return f"[筹码分布] {code}: {res.get('error', '')}"
+        klines = res.get("data", []) or []
         if len(klines) < 10:
             return f"[筹码分布] {code}: K线数据不足({len(klines)}根)"
 
@@ -2516,7 +2522,7 @@ def get_astock_chip_distribution(
         c90 = cyq["concentration_90"]
         c70 = cyq["concentration_70"]
 
-        lines.append(f"# 数据源: 东财K线({len(klines)}根) + Python CYQ算法")
+        lines.append(f"# 数据源: 东财行情(playwright, {len(klines)}根) + Python CYQ算法")
         lines.append("")
 
         # Chip health assessment

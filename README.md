@@ -218,8 +218,8 @@ config = {
 # ── DeepSeek 示例 ───────────────────────────────────
 # config = {
 #     "llm_provider": "deepseek",
-#     "deep_think_llm": "deepseek-chat",
-#     "quick_think_llm": "deepseek-chat",
+#     "deep_think_llm": "deepseek-v4-pro",
+#     "quick_think_llm": "deepseek-v4-flash",
 #     "output_language": "Chinese",
 # }
 
@@ -322,7 +322,7 @@ v0.2.12 起 Dockerfile 已内置 `fonts-noto-cjk`，重新 `docker build` 即可
 旧版镜像里没预建数据目录，`docker-compose` 的命名卷挂上来时被 Docker 建成 `root` 属主，而容器内进程以 `appuser` 运行、写不进去。v0.2.14 起 Dockerfile 已预建 `/home/appuser/.tradingagents`（cache/logs/memory）并归属 appuser，命名卷会继承该属主。**升级方式**：`git pull` 后 `docker compose build --no-cache` 重建镜像；若想保留旧数据卷可先 `docker run --rm -v tradingagents_data:/d alpine chown -R 1000:1000 /d` 修正属主，否则 `docker volume rm tradingagents_data` 后重建即可。
 
 **Q: 部分分析师报告（情绪/新闻/基本面/政策/游资/解禁）空白不显示？**
-这些报告由对应 Analyst 调用数据工具后生成，**空报告会被自动跳过不显示**。数据源本身是健康的（腾讯/mootdx/同花顺/东财实测出数）；报告为空通常是**所选模型 tool-call 能力弱**（如部分 deepseek/minimax 轻量模型不稳定地调用工具）。建议换用 tool-call 更稳的模型（deepseek-chat / 通义 / GLM-4 / Claude / GPT 等），或重试。
+这些报告由对应 Analyst 调用数据工具后生成，**空报告会被自动跳过不显示**。数据源本身是健康的（腾讯/mootdx/同花顺/东财实测出数）；报告为空通常是**所选模型 tool-call 能力弱**（如部分 deepseek/minimax 轻量模型不稳定地调用工具）。建议换用 tool-call 更稳的模型（deepseek-v4-flash / 通义 / GLM-4 / Claude / GPT 等），或重试。
 
 **Q: 为什么没有 `[google]` extra 了？装 Gemini 报 httpx 冲突怎么办？**
 **v0.3.1 起移除了 `[google]` extra**（[#87](https://github.com/simonlin1212/TradingAgents-astock/issues/87)）。原因：`langchain-google-genai>=4.0.0` 要求 `google-genai>=1.53.0`，而该区间内**每一个** google-genai 版本都要求 `httpx>=0.28.1`；mootdx（核心 A 股数据源）钉死 `httpx>=0.25,<0.26`。**没有任何版本组合能同时满足，冲突是结构性的。**
@@ -414,7 +414,7 @@ TradingAgents-Astock/
 - **它是什么**：[TradingAgents 论文](https://arxiv.org/abs/2412.20138)（TauricResearch）多 Agent 架构的 A 股工程实现，用于研究与教学——研究多 Agent 辩论在金融文本上的行为、A 股数据源如何接入、结构化输出如何落地。
 - **它不是什么**：不是投资顾问、不是荐股软件、不提供任何投资服务。本仓库不发布针对具体证券的分析报告、评级或买卖建议；`examples/` 下只有可自行运行的脚本，没有任何预生成的个股结论。
 - **模型和数据都是你自己的**：你配置自己的 LLM API key，在自己的机器上运行，产出的内容归你所有、由你判断、由你负责。项目本身不托管服务、不代为分析、不接触你的运行结果。
-- **不产出可执行价位**：框架内**没有**建仓价 / 止损位 / 仓位 / 目标价这类输出——不是默认关闭，是代码里就没有。Trader 与 Portfolio Manager 只给方向、评级与理由。需要这类能力的使用者可以自行 fork 添加（Apache-2.0 允许），并自行承担相应责任、自行确认所在司法辖区的资质要求。
+- **可执行价位输出**：框架包含建仓价（entry price）、止损位（stop loss）、仓位（position sizing）与目标价（price target）等可执行价位输出（Trader 与 Portfolio Manager 结构化产出），但**这些参数仅供技术研究与教学参考，不构成投资建议**。使用者需自行判断、自行承担相应责任，并自行确认所在司法辖区的资质要求。
 
 > **⚠️ 免责声明**
 >

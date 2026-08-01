@@ -202,8 +202,8 @@ config = {
 # ── DeepSeek Example ───────────────────────────────────────────────────────
 # config = {
 #     "llm_provider": "deepseek",
-#     "deep_think_llm": "deepseek-chat",
-#     "quick_think_llm": "deepseek-chat",
+#     "deep_think_llm": "deepseek-v4-pro",
+#     "quick_think_llm": "deepseek-v4-flash",
 #     "output_language": "Chinese",
 # }
 
@@ -296,7 +296,7 @@ Starting from v0.2.12, the Dockerfile includes `fonts-noto-cjk` built-in. Simply
 Older images did not pre-create the data directory. When the `docker-compose` named volume is mounted, Docker creates it as `root`-owned, but the process inside the container runs as `appuser` and cannot write to it. Starting from v0.2.14, the Dockerfile pre-creates `/home/appuser/.tradingagents` (cache/logs/memory) and sets ownership to `appuser`, so named volumes inherit this ownership. **To upgrade**: after `git pull`, rebuild the image with `docker compose build --no-cache`. If you want to keep the old data volume, first run `docker run --rm -v tradingagents_data:/d alpine chown -R 1000:1000 /d` to fix the ownership; otherwise, simply remove the volume with `docker volume rm tradingagents_data` and rebuild.
 
 **Q: Some analyst reports (Sentiment/News/Fundamentals/Policy/Hot Money/Lock-up Expiry) are blank and not displayed?**
-These reports are generated after the corresponding Analyst calls data tools. **Empty reports are automatically skipped and not displayed.** The data sources themselves are healthy (Tencent/mootdx/Tonghuashun/Dongcai have been tested and return data). Reports are usually empty because **the selected model has weak tool-call capabilities** (e.g., some lightweight deepseek/minimax models are unstable when calling tools). It is recommended to switch to a model with more stable tool-calls (deepseek-chat / Tongyi / GLM-4 / Claude / GPT, etc.), or retry.
+These reports are generated after the corresponding Analyst calls data tools. **Empty reports are automatically skipped and not displayed.** The data sources themselves are healthy (Tencent/mootdx/Tonghuashun/Dongcai have been tested and return data). Reports are usually empty because **the selected model has weak tool-call capabilities** (e.g., some lightweight deepseek/minimax models are unstable when calling tools). It is recommended to switch to a model with more stable tool-calls (deepseek-v4-flash / Tongyi / GLM-4 / Claude / GPT, etc.), or retry.
 
 **Q: Why is there no `[google]` extra any more? How do I install Gemini?**
 **The `[google]` extra was removed in v0.3.1** ([#87](https://github.com/simonlin1212/TradingAgents-astock/issues/87)). `langchain-google-genai>=4.0.0` requires `google-genai>=1.53.0`, and **every** google-genai release in that range requires `httpx>=0.28.1`, while mootdx (the core A-share data source) pins `httpx>=0.25,<0.26`. **No version combination satisfies both — the conflict is structural, not a bad pin.**

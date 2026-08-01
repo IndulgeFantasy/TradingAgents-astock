@@ -21,14 +21,6 @@ from tradingagents.agents.utils.structured import (
 )
 
 
-# Mirrors the Trader: the schema alone cannot stop the model from putting
-# price levels into the prose fields, so the prompt says it explicitly too.
-_NO_LEVELS_RULE = (
-    "\n- Do NOT state entry prices, stop-loss levels, target prices or "
-    "position sizes for this security; give the rating and the reasoning."
-)
-
-
 def create_portfolio_manager(llm):
     structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
 
@@ -89,7 +81,7 @@ def create_portfolio_manager(llm):
 
 ---
 
-Be decisive and ground every conclusion in specific evidence from the analysts.{_NO_LEVELS_RULE}{get_language_instruction()}"""
+Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
 
         final_trade_decision = invoke_structured_or_freetext(
             structured_llm,
