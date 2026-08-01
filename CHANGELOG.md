@@ -6,6 +6,189 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [0.4.0] — 2026-07-31
+
+新增：让节点走**个人 Claude Pro/Max 订阅额度**而非按 token 计费的 Anthropic API。
+基于社区 PR [#86](https://github.com/simonlin1212/TradingAgents-astock/pull/86)
+（感谢 [@kingxiaozhe](https://github.com/kingxiaozhe)）。默认关闭，行为不变。
+
+### 新增：`claude_agent_sdk` provider（可选依赖 `[agentsdk]`）
+
+此前项目对 Claude 只有 `anthropic` provider＝走 `ANTHROPIC_API_KEY` **按 token 计费**，
+没有任何走订阅的通道。本版补上：经 Claude Agent SDK 调用本机已登录的 `claude`，
+**消耗订阅额度，不产生 API 账单**。
+
+- **两档覆盖**：`deep_think_provider_override` 只覆盖深度节点（Research / Portfolio
+  Manager）；再加 `quick_think_provider_override` 则含 7 个工具分析师＝全节点走订阅。
+  Web 侧栏三档（关闭 / 仅深度 / 所有节点）。
+- **工具桥接**：分析师的 LangChain 工具桥接为 Agent SDK 进程内 MCP 工具，SDK 内部跑完
+  ReAct 循环返回最终报告，LangGraph 视为完成，无需改图。
+- **启动护栏**：检测到 `ANTHROPIC_API_KEY` 与订阅覆盖共存时**直接报错中止**——
+  API key 优先级更高，留着它会悄悄走 API 计费。
+- **撞额度自动降级**到配置的付费 provider（`agent_sdk_fallback_provider` / `_model`）。
+- 仅供个人自用：消耗的是使用者自己账号的额度。
+
+### 在 PR 基础上的四处改动
+
+1. **模型默认值改用别名**。PR 默认 `claude-opus-4-8`，写死的完整 id 会随版本迭代过期
+   （仓库 `model_catalog` 的 anthropic 条目就已停在 `4-6`）。改用 `claude` CLI 的
+   `opus` / `sonnet` 别名——恒指向最新模型。完整 id 仍然支持。
+   quick 节点默认给 `sonnet` 而非 `opus`：节点数量多（7 分析师 + 辩手），
+   订阅按额度限流，全用 opus 很快撞上限。
+2. **🔴 凭据失效不再静默降级到计费 provider**。原实现里认证失败会走
+   `_SDKResultError` → 落进 `_FALLBACK_ERRORS` → 降级到按 token 计费的 provider。
+   用户开订阅模式就是为了避免账单，token 一过期就悄悄开始计费——正是启动护栏 F-004
+   想防的事，只是从启动时挪到了运行中。新增 `_AuthError`（**刻意不在** `_FALLBACK_ERRORS`
+   里）+ `_looks_like_auth_failure()` 正向识别，报错里直接给出 `claude setup-token` 修复步骤。
+
+   > 实测发现有必要：OAuth token 过期时 SDK 把它翻译成 `Claude Code returned an
+   > error result: success`，`ResultMessage.subtype` 仍是 `"success"` 而 `is_error=True`，
+   > 真正原因只出现在 `api_retry` 事件与助手文本里。用户看到那句话完全无从下手。
+3. **未采纳 PR 夹带的全局默认变更**：PR 把 `llm_provider` 默认从 `openai/gpt-5.4`
+   改成 `deepseek/deepseek-v4-pro`，那是贡献者个人偏好，会改变所有人的默认行为。
+4. **未采纳 PR 的 `docs/codebase-context/` 与 `specs/`**（约 600 行贡献者自用的
+   spec-driven 脚手架文档）。另外 PR 的 `factory.py` 基于较旧的 main，整体取用会
+   **回退 v0.2.20 的 `openai_compatible` provider**——已改为只补 4 行路由，
+   测试 `test_openai_compatible_is_routed_to_openai_client` 当场抓到了这个回退。
+
+### 审计中又修的三处
+
+- **`anthropic` 无法作为降级 provider（死结）**：原护栏检测到 `ANTHROPIC_API_KEY`
+  就一律中止——留着 key 启动被拦，删掉 key 又会在撞额度真要降级时认证失败。
+  改为在 **Agent SDK 子进程环境**里把该变量置空（`ClaudeAgentOptions.env`），
+  父进程保留供降级使用，启动只告警不中止。
+- **认证识别过宽（我引入的）**：原实现扫所有助手正文匹配 "invalid api key" 等词。
+  工具分析师会复述桥接工具的失败原文——某个行情源自己的 key 失效时正文里就可能
+  出现这些词，会被误判成订阅凭据失效并中止整轮分析。收窄为**只在合成错误消息**
+  （`model == "<synthetic>"` 或带 `error` 字段）上匹配。
+- **Web UI「所有节点」把深度模型复制给了 quick 节点**，覆盖掉 sonnet 默认值——
+  7 个分析师 + 辩手全跑 opus 会让订阅额度烧得极快，且与文档所述矛盾。
+
+- **401 只出现在 `ResultMessage` 时被漏判**：该路径会落进 `_SDKResultError`
+  → `_FALLBACK_ERRORS` → **静默降级到计费 provider**，正好违背「不产生 API 账单」
+  这条承诺。改为先判 `api_error_status == 401` 再走通用分支。
+- **降级客户端没带 callbacks**：降级意味着开始计费，而统计/成本回调恰好在
+  花钱的时候看不到这些调用。已把 callbacks 一并传入。
+- **跨 provider 降级仍转发主 provider 的 `backend_url`**（如把 anthropic 请求发到
+  MiniMax 网关）——显式指定另一家时改为不带端点，让其用自己的默认地址。
+
+- **`(role, content)` 元组消息被静默清空**：`Reflector.reflect_on_final_decision()`
+  传的正是 `[("system", ...), ("human", ...)]`，而消息解析只认 BaseMessage 与 dict，
+  元组走 `getattr` 取不到字段 → 两条消息双双变空串 → SDK 收到空 prompt **却照常
+  返回内容**，是「不报错的错答案」。quick 节点走订阅时这条路径是活的。
+
+### 依赖
+
+`[agentsdk]` 链路为 `claude-agent-sdk → mcp → httpx2`，**不碰 httpx**，与 mootdx 的
+`httpx<0.26` 无冲突（`uv lock --dry-run` 实测通过）。与 #87 中被移除的 `[google]`
+情况不同，无需单开 venv。PR 注释里「会与 mootdx 冲突」的说法已过时（mcp 已迁到 httpx2），一并订正。
+
+### 测试
+
+`pytest tests/` **214 passed / 1 skipped / 45 subtests**。新增认证失败识别、
+`_AuthError` 不参与降级、报错可操作性三组断言。端到端实跑验证链路可达
+（本机 OAuth token 已过期，正确地报出可操作错误而非静默降级）。
+
+## [0.3.1] — 2026-07-31
+
+修三个静默失败 + 合并两个社区 PR。无破坏性变更。
+
+### 修复：`uv sync` 因 `[google]` extra 的无解冲突而对所有人失败（#87）
+
+感谢 [@jakeparkcolde](https://github.com/jakeparkcolde) 的高质量报告与复现步骤。
+
+`langchain-google-genai>=4.0.0` 要求 `google-genai>=1.53.0`，而该区间内**每一个**
+google-genai 版本都要求 `httpx>=0.28.1`；`mootdx`（核心 A 股数据源）钉死
+`httpx>=0.25,<0.26`。**没有任何版本组合能同时满足——冲突是结构性的，不是坏 pin。**
+
+真正的杀伤力在于：**uv 构建的是覆盖所有 extra 的 universal lock**，所以只要这个
+extra 存在，`uv sync` 就对**所有人**失败，包括从不用 Gemini 的用户。
+
+- **移除 `[google]` extra**。留空更糟——`pip install .[google]` 会静默什么都不装，
+  用户以为装好了，直到运行期才炸。
+- `google_client.py` 导入失败时抛出**带可直接执行安装命令**的 `ImportError`，
+  而不是裸 `ModuleNotFoundError`（沿用 v0.2.17 处理 fpdf 的做法）。
+- `tests/test_google_api_key.py` 改为缺依赖时 skip——此前它会让 `pytest tests/`
+  **在收集阶段整体中断**，一个测试都跑不了。
+- `mootdx` 下限 `0.10.0` → `0.11.7`：放宽会让 uv 回溯到要求 `pandas<1.3.5` 的
+  远古版本，报出与真实成因无关的 pandas 冲突，把真正的 httpx 问题盖住。
+
+实测 `uv lock` 由失败转为成功解析。
+
+### 修复：A 股历史决策回报永远查不到，记忆闭环从未生效（社区 PR #84）
+
+感谢 [@wangyuxun6699](https://github.com/wangyuxun6699)。
+
+`_fetch_returns` 把裸六位码直接传给 yfinance，而同一函数里 benchmark 用的却是
+`"000300.SS"`（带后缀）。yfinance 对裸码返回空表 → `len(stock) < 2` → 返回 None
+→ **记忆条目永久 pending**，且被 `except Exception` 吞成 warning。
+实测：`600519` → 0 行、`600519.SS` → 10 行；`000001` → 0 行、`000001.SZ` → 10 行。
+等于 agent「从历史决策学习」的能力对 A 股一直是空转。
+
+新增 `_normalize_yfinance_ticker()`：沪市 → `.SS`、深市 → `.SZ`，
+`SH600519` / `600519.SH` 等写法一并归一，非 A 股代码原样返回。
+
+**本版在 PR 基础上补了一条**：Yahoo **完全不覆盖北交所**（实测 `920002` 的裸码 /
+`.BJ` / `.SS` / `.SZ` 四种写法全部返回空表）。PR 正确地没有硬造后缀，但这样北交所
+条目会每次运行白发一次网络请求、且永远 pending 不给任何理由。新增
+`_is_unsupported_by_yfinance()` 直接短路并明确写清原因。
+
+### 修复：DeepSeek V4 / MiniMax M2.x 结构化输出不稳定（社区 PR #83）
+
+感谢 [@wangyuxun6699](https://github.com/wangyuxun6699)。
+
+两类模型的结构化输出各自会失败、退回自由文本 —— 多一次模型调用，且
+Research Manager / Trader / Portfolio Manager 的输出格式不稳定，中文评级更容易
+解析失败：**DeepSeek V4 / reasoner** 不接受 LangChain 结构化输出默认发送的
+`tool_choice`；**MiniMax M2.x** 则是不支持 json_mode，且 `<think>` 内容会污染
+最终报告。（⚠️ PR 描述把两者都写成「不接受 tool_choice」，但其代码与测试明确
+声明 MiniMax `supports_tool_choice=True`——以代码为准，本地无 MiniMax key 无法
+实测，不据未验证的描述改动行为。）
+
+**这正是 v0.2.19「中文 TRADING SIGNAL 恒为 HOLD」的上游成因**：v0.2.19 修的是症状
+（让 `parse_rating` 认中文），本版修的是病因（结构化输出为什么会失败）。
+
+新增模型能力声明表 `llm_clients/capabilities.py`（精确 ID + 前缀匹配，未知模型
+保持宽松默认）：对 DeepSeek V4/reasoner 抑制不兼容的 `tool_choice` 并保留 Schema
+工具绑定（不再直接降级为自由文本），对 MiniMax M2.x 关闭 json_mode 并启用
+`reasoning_split` 防止 `<think>` 污染最终报告。带前向兼容测试（`MiniMax-M3`
+不继承 M2 行为、DeepSeek V3 家族不被 V4 结论误伤）。
+
+本版在 PR 基础上收紧两处：① `^deepseek-v\d` 会把 catalog 在售的 V3.2 与未来所有
+版本一并归类为「不接受 tool_choice」，而该结论只在 V4/reasoner 上实测过，被误伤的
+型号反而更容易退回自由文本——收窄为 `^deepseek-v4(?:$|[.-])`，与作者自己给 MiniMax
+写的 `^MiniMax-M2(?:$|[.-])` 同一把尺子。② 抑制 `tool_choice` 原用 `setdefault`，
+调用方显式传入时会被保留、能力声明形同虚设——改为 pop + 覆盖并 warning。
+
+### 测试
+
+`pytest tests/` **169 passed / 1 skipped / 45 subtests**，且现在**开箱即可运行**
+（此前缺 langchain-google-genai 会导致收集阶段整体中断）。
+
+## [0.3.0] — 2026-07-24
+
+明确项目定位为「框架的工程实现与研究复现」，并**移除可执行价位相关能力**。**有破坏性变更**（见下）。
+
+### 移除（破坏性）
+- **可执行价位能力整体删除**：Trader 与 Portfolio Manager 现在只输出方向 / 评级与理由，框架内**不再存在**建仓价、止损位、仓位、目标价这类输出。
+  - 删除字段：`TraderProposal.entry_price` / `.stop_loss` / `.position_sizing`、`PortfolioDecision.price_target`。
+  - 提示词同步收紧：仅删字段挡不住模型把价位写进散文字段，因此系统提示与 `executive_summary` / `reasoning` 的字段描述都显式要求不给价位。
+  - 渲染函数不再输出 `**Entry Price**` / `**Stop Loss**` / `**Position Sizing**` / `**Price Target**` 四节；其余 markdown 格式不变。
+  - **这是删除而不是开关**——不提供 opt-in 配置项。需要这类能力的使用者可自行 fork 添加（Apache-2.0 允许），并自行承担相应责任。
+  - **升级影响**：依赖 `TraderProposal.entry_price` 等字段的下游代码需自行调整。
+- **`ResearchPlan.strategic_actions`** 的字段描述去掉「including position sizing guidance」。
+
+### 移除
+- **`examples/cases/` 下的 3 份个股分析报告**（含具体建仓价 / 止损 / 目标价）。本仓库不再随代码分发针对具体证券的分析报告或评级结论；`examples/run_cases.py` 保留为可自行运行的脚本，运行结果由使用者自行保管。
+- `DEV_LOG.md` / `CHANGES_FROM_UPSTREAM.md` 的 E2E 记录改为脱敏样本，只保留工程指标（耗时 / AI message 数 / 链路通过），移除个股评级与分析结论。
+
+### 文档
+- README 新增「项目定位」章节：说明这是 [arXiv 2412.20138](https://arxiv.org/abs/2412.20138) 框架的工程实现，用于研究与教学；不提供投资服务；模型与数据由使用者自备、产出归使用者所有。
+
+### 测试
+- 新增 `TestExecutionLevelsFlag`：锁定「默认 schema 无价位字段 / 开启后有 / 默认提示词禁止给价位 / 开启后要求给价位 / 默认渲染不含价位」五条。
+- 全量 164 passed + 48 subtests passed。
+
 ## [0.2.21] — 2026-07-23
 
 新增可配置的技术分析回溯窗口 / 按月分析（#16）。无破坏性变更、无新依赖。

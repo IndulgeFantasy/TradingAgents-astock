@@ -177,6 +177,22 @@ def _build_config() -> dict:
     config["max_risk_discuss_rounds"] = 1
     config["checkpoint_enabled"] = True
     config["output_language"] = "Chinese"
+    # Optional: route nodes through a personal Claude Pro/Max subscription (Agent
+    # SDK). Scope: "deep" = Research/Portfolio only; "all" = + the 7 analysts.
+    # Leaving the fallback keys None makes the graph fall back to the
+    # sidebar-selected llm_provider + models on quota/failure.
+    scope = st.session_state.get("subscription_scope", "off")
+    # 侧栏那个输入框只配**深度节点**的模型。不要把它同时赋给 quick——
+    # quick 节点有 7 个分析师 + 多空/交易员/风险辩手，把深度节点的 opus 复制过去
+    # 会让订阅额度烧得极快，也与 README / 侧栏提示所说的「quick 默认 sonnet」矛盾。
+    # quick 的模型交给 DEFAULT_CONFIG（默认 sonnet），需要时在 config 层单独覆盖。
+    sub_model = st.session_state.get("agent_sdk_model")
+    if scope in ("deep", "all"):
+        config["deep_think_provider_override"] = "claude_agent_sdk"
+        if sub_model:
+            config["agent_sdk_model"] = sub_model
+    if scope == "all":
+        config["quick_think_provider_override"] = "claude_agent_sdk"
     return config
 
 

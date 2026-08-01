@@ -7,7 +7,10 @@ from unittest.mock import MagicMock, patch
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 from tradingagents.graph.reflection import Reflector
-from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.graph.trading_graph import (
+    TradingAgentsGraph,
+    _normalize_yfinance_ticker,
+)
 from tradingagents.graph.propagation import Propagator
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 
@@ -410,6 +413,25 @@ class TestTradingMemoryLogCore:
 
 class TestDeferredReflection:
 
+    # Yahoo Finance ticker normalization
+
+    def test_normalize_yfinance_ticker_adds_mainland_exchange_suffix(self):
+        assert _normalize_yfinance_ticker("600519") == "600519.SS"
+        assert _normalize_yfinance_ticker("000001") == "000001.SZ"
+        assert _normalize_yfinance_ticker("688017") == "688017.SS"
+
+    def test_normalize_yfinance_ticker_preserves_qualified_symbols(self):
+        assert _normalize_yfinance_ticker("600519.SS") == "600519.SS"
+        assert _normalize_yfinance_ticker("600519.SH") == "600519.SS"
+        assert _normalize_yfinance_ticker("SH600519") == "600519.SS"
+        assert _normalize_yfinance_ticker("NVDA") == "NVDA"
+
+    def test_normalize_yfinance_ticker_does_not_invent_beijing_suffix(self):
+        assert _normalize_yfinance_ticker("830799") == "830799"
+        assert _normalize_yfinance_ticker("920002") == "920002"
+        assert _normalize_yfinance_ticker("BJ830799") == "830799"
+        assert _normalize_yfinance_ticker("830799.BJ") == "830799"
+
     # update_with_outcome
 
     def test_update_replaces_pending_tag(self, tmp_path):
@@ -514,20 +536,52 @@ class TestDeferredReflection:
         stock_prices = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
         bench_prices = [4000.0, 4020.0, 4040.0, 4030.0, 4050.0, 4060.0]
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
-            def _fetch(code, count=250):
-                return _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices)
-            mock_fetch.side_effect = _fetch
+        with patch("tradingagents.agents.utils.playwright_tools._get_client") as mock_get_client:
+            fake = MagicMock()
+            fake.stock_kline_full.side_effect = lambda code, days: {
+                "success": True,
+                "data": _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices),
+            }
+            mock_get_client.return_value = fake
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "688017", "2026-01-05")
         assert raw is not None and alpha is not None and days is not None
         assert isinstance(raw, float) and isinstance(alpha, float) and isinstance(days, int)
         assert days == 5
+        # 收益验证: 个股 (106-100)/100=6%, 基准 (4060-4000)/4000=1.5%, alpha=4.5%
+        assert abs(raw - 0.06) < 1e-9
+        assert abs(alpha - 0.045) < 1e-9
+
+    def test_fetch_returns_uses_astock_native_symbol(self):
+        """Playwright channel uses the 6-digit A-stock code, not yfinance's .SS suffix."""
+        stock_prices = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+        bench_prices = [4000.0, 4010.0, 4020.0, 4030.0, 4040.0, 4050.0]
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        with patch("tradingagents.agents.utils.playwright_tools._get_client") as mock_get_client:
+            fake = MagicMock()
+            fake.stock_kline_full.side_effect = lambda code, days: {
+                "success": True,
+                "data": _kline_data(bench_prices) if code == "000300" else _kline_data(stock_prices),
+            }
+            mock_get_client.return_value = fake
+            TradingAgentsGraph._fetch_returns(mock_graph, "600519", "2026-01-05")
+
+        # 个股请求用东财原生 6 位代码（不含 .SS 后缀），基准固定为 000300
+        calls = [c.args[0] for c in fake.stock_kline_full.call_args_list]
+        assert "600519" in calls
+        assert "000300" in calls
+        assert not any(".SS" in c for c in calls)
 
     def test_fetch_returns_too_recent(self):
         """Only 1 data point available -> returns (None, None, None), no crash."""
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("tradingagents.dataflows.a_stock._em_fetch_klines") as mock_fetch:
-            mock_fetch.return_value = _kline_data([100.0])
+        with patch("tradingagents.agents.utils.playwright_tools._get_client") as mock_get_client:
+            fake = MagicMock()
+            fake.stock_kline_full.side_effect = lambda code, days: {
+                "success": True,
+                "data": _kline_data([4000.0, 4010.0], start_date="2026-04-19") if code == "000300"
+                else _kline_data([100.0], start_date="2026-04-19"),
+            }
+            mock_get_client.return_value = fake
             raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "688017", "2026-04-19")
         assert raw is None and alpha is None and days is None
 
@@ -632,7 +686,6 @@ class TestPortfolioManagerInjection:
             rating=PortfolioRating.OVERWEIGHT,
             executive_summary="Build position gradually over the next two weeks.",
             investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
-            price_target=215.0,
             time_horizon="3-6 months",
         )
         llm = _structured_pm_llm(captured, decision)
@@ -642,7 +695,8 @@ class TestPortfolioManagerInjection:
         assert "**Rating**: Overweight" in md
         assert "**Executive Summary**: Build position gradually" in md
         assert "**Investment Thesis**: AI capex cycle" in md
-        assert "**Price Target**: 215.0" in md
+        # 框架不产出目标价——渲染里永远不该出现这一节。
+        assert "Price Target" not in md
         assert "**Time Horizon**: 3-6 months" in md
 
     def test_pm_falls_back_to_freetext_when_structured_unavailable(self):

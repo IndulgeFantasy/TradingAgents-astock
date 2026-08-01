@@ -6,7 +6,7 @@
 - **仓库**: https://github.com/simonlin1212/TradingAgents-astock
 - **协议**: Apache 2.0
 - **Python**: >=3.10
-- **当前版本**: 0.2.21
+- **当前版本**: 0.4.0
 
 ## 架构
 
@@ -69,7 +69,9 @@
 ## 已知问题与注意事项
 
 ### 依赖冲突（v0.2.6 已缓解）
-mootdx 锁死 httpx==0.25.2，与 langchain-google-genai 的 httpx>=0.28.1 冲突。v0.2.6 将 google-genai 移至可选依赖 `[google]`，`pip install -e .` 不再冲突。需要 Google 模型时 `pip install -e ".[google]"`。
+mootdx 钉死 `httpx>=0.25,<0.26`，与 langchain-google-genai 所需的 `httpx>=0.28.1` **结构性冲突**（该区间内每个 google-genai 版本都要 0.28.1，无解）。
+
+**v0.3.1 起 `[google]` extra 已移除**（#87）：uv 构建覆盖所有 extra 的 universal lock，extra 存在就让**所有人**的 `uv sync` 失败。留空更糟（`pip install .[google]` 静默装空）。需要 Gemini 时显式装 `pip install --no-deps "langchain-google-genai>=4.0.0"` + `pip install "google-genai>=1.53.0" "httpx>=0.28.1"`；`google_client.py` 导入失败会打印这两条命令。⚠️ 新增依赖后务必跑 `uv lock --dry-run` 验证——**pip 能装通不代表 uv 能锁**。
 
 ### akshare 已移除（v0.2.5）
 v0.2.5 起完全移除 akshare 依赖，所有数据通过直连 HTTP API 或 playwright_service 获取。

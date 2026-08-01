@@ -42,7 +42,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _get_prefix(code: str) -> str:
-    """6-digit A-stock code -> market prefix for Tencent API."""
+    """6-digit A-stock code -> market prefix for Tencent API.
+
+    The 92 prefix must be checked before the leading-9 rule: the Beijing Stock
+    Exchange started issuing 920xxx codes for new listings in October 2024, and
+    a bare ``startswith("9")`` routes them to Shanghai, where the Tencent quote
+    endpoint returns an empty payload (issue #85).  Only 900xxx (Shanghai B
+    shares) legitimately belongs to ``sh``.
+    """
+    if code.startswith("92"):
+        return "bj"
     if code.startswith(("6", "9")):
         return "sh"
     elif code.startswith("8"):
@@ -1165,7 +1174,7 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
 
 def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
     """Sina Finance stock news API (backup source)."""
-    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+    prefix = _get_prefix(code)
     url = (
         f"https://vip.stock.finance.sina.com.cn/corp/view/"
         f"vCB_AllNewsStock.php?symbol={prefix}{code}&Page=1"

@@ -1,6 +1,23 @@
 from typing import Any, Optional
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError as exc:  # pragma: no cover - depends on optional install
+    # No `[google]` extra exists any more (#87): langchain-google-genai needs
+    # httpx>=0.28.1 while mootdx pins httpx<0.26, so the two cannot be locked
+    # together. Give the actual install command instead of a bare
+    # ModuleNotFoundError that leaves the user guessing.
+    raise ImportError(
+        "Gemini support requires langchain-google-genai, which conflicts with "
+        "mootdx's httpx pin and therefore is not installed by default (#87).\n"
+        "Install it explicitly (mootdx talks TDX over TCP and does not import "
+        "httpx at runtime, so bumping httpx is safe in practice):\n"
+        '  pip install --no-deps "langchain-google-genai>=4.0.0"\n'
+        '  pip install "google-genai>=1.53.0" "httpx>=0.28.1"\n'
+        "Or use a separate environment for Gemini. "
+        "Any other provider (OpenAI / DeepSeek / Qwen / GLM / OpenAI-compatible) "
+        "works without this."
+    ) from exc
 
 from .base_client import BaseLLMClient, normalize_content
 from .validators import validate_model

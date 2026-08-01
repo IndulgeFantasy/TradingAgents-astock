@@ -1,3 +1,5 @@
+<p align="center"><b>简体中文</b> | <a href="README_en.md">English</a></p>
+
 <h1 align="center">TradingAgents-Astock</h1>
 
 <p align="center">
@@ -6,7 +8,8 @@
 </p>
 
 <p align="center">
-  <b>⚠️ 免责声明：本项目仅供学习研究与技术演示，不构成任何投资建议。投资决策请咨询持牌专业机构。</b>
+  <b>⚠️ 本项目是 <a href="https://arxiv.org/abs/2412.20138">TradingAgents 论文</a>框架的工程实现与研究复现，面向研究与教学。<br>
+  不构成任何投资建议，也不提供任何投资服务。</b>
 </p>
 
 <p align="center">
@@ -17,22 +20,16 @@
   <a href="./CHANGES_FROM_UPSTREAM.md"><img alt="改动记录" src="https://img.shields.io/badge/改动记录-CHANGES-orange"/></a>
 </p>
 
----
-
-## 目录
-
-- [为什么做这个 Fork](#为什么做这个-fork)
-- [与上游对比](#与上游对比)
-- [架构概览](#架构概览)
-- [7 个 Analyst 角色](#7-个-analyst-角色)
-- [数据源](#数据源)
-- [快速开始](#快速开始)
-- [Web UI](#web-ui)
-- [配置说明](#配置说明)
-- [项目结构](#项目结构)
-- [致谢](#致谢)
-- [Donate](#donate)
-- [许可证](#许可证)
+<p align="center">
+  <a href="#为什么做这个-fork">为什么做这个 Fork</a> ·
+  <a href="#与上游对比">与上游对比</a> ·
+  <a href="#架构概览">架构概览</a> ·
+  <a href="#7-个-analyst-角色">Analyst 角色</a> ·
+  <a href="#数据源">数据源</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#web-ui">Web UI</a> ·
+  <a href="#常见问题排错">排错</a>
+</p>
 
 ---
 
@@ -89,7 +86,7 @@
 │               三方风险辩论                                 │
 ├─────────────────────────────────────────────────────────┤
 │            Portfolio Manager 最终决策                      │
-│     （深度思考 LLM，输出 Buy/Hold/Sell + 仓位）             │
+│     （深度思考 LLM，输出评级 + 理由）                       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -154,15 +151,21 @@ git clone https://github.com/simonlin1212/tradingagents-astock.git
 cd tradingagents-astock
 pip install -e .
 
-# 如需使用 Google Gemini 模型（可选）：
-pip install -e ".[google]"
+# 如需使用 Google Gemini 模型（无 [google] extra，需显式装，见下方 FAQ）：
+pip install --no-deps "langchain-google-genai>=4.0.0"
+pip install "google-genai>=1.53.0" "httpx>=0.28.1"
+
+# 如需让节点走你个人 Claude Pro/Max 订阅额度而非 API 计费（可选）：
+pip install -e ".[agentsdk]"
 ```
 
 > **装完即可用，无需 Docker。** 安装后直接跑 `streamlit run web/app.py`（Web UI）或 `tradingagents`（CLI）即可，详见下方「Web UI」「CLI 方式」两节。Docker 仅是可选的部署方式，本地开发不需要。
 
 ### 2. 配置 LLM
 
-> **必须使用 API Key**，不能用 Claude/ChatGPT 订阅版。每次分析需 30-50 次 LLM 调用，只有 API 模式支持。
+> **默认走 API Key 计费**。每次分析需 30-50 次 LLM 调用。
+>
+> **例外（v0.4.0 新增）**：装 `[agentsdk]` 后可让部分或全部节点经 Claude Agent SDK 走你**个人 Claude Pro/Max 订阅额度**，不产生 API 账单。见下方「用个人 Claude 订阅额度」。
 
 在项目根目录创建 `.env` 文件，按你选择的供应商配置：
 
@@ -307,6 +310,11 @@ streamlit run web/app.py
 **Q: 导出 PDF 报 `UnicodeEncodeError: 'latin-1' codec can't encode`？**
 你的环境里装了**旧版 `fpdf`（pyfpdf）**，它和本项目用的 `fpdf2` 都以 `fpdf` 名称导入、互相冲突。执行：`pip uninstall -y fpdf && pip install "fpdf2>=2.8.6"`。实在不行可改用「下载 Markdown」导出（零依赖，永远可用）。
 
+**Q: Docker 里怎么跑 Web UI？容器启动报 `Invalid value: File does not exist: web/app.py`？**
+用 compose 里的 `web` 服务：`docker compose up web`，然后开 http://localhost:8501 。
+
+报这个错通常是因为命令写成了 `streamlit run web/app.py`——这条**依赖当前工作目录**，工作目录不对就找不到文件。正确的入口是 `tradingagents-web`（即 `web.launch:main`），它按 `__file__` 解析 `app.py` 的绝对路径，跟工作目录无关。本地跑同理，装完后直接 `tradingagents-web` 最稳。
+
 **Q: Docker 里导出 PDF 报「未找到中文字体」？**
 v0.2.12 起 Dockerfile 已内置 `fonts-noto-cjk`，重新 `docker build` 即可。旧镜像可临时 `apt install fonts-noto-cjk`，或改用 Markdown 导出。
 
@@ -316,8 +324,21 @@ v0.2.12 起 Dockerfile 已内置 `fonts-noto-cjk`，重新 `docker build` 即可
 **Q: 部分分析师报告（情绪/新闻/基本面/政策/游资/解禁）空白不显示？**
 这些报告由对应 Analyst 调用数据工具后生成，**空报告会被自动跳过不显示**。数据源本身是健康的（腾讯/mootdx/同花顺/东财实测出数）；报告为空通常是**所选模型 tool-call 能力弱**（如部分 deepseek/minimax 轻量模型不稳定地调用工具）。建议换用 tool-call 更稳的模型（deepseek-chat / 通义 / GLM-4 / Claude / GPT 等），或重试。
 
-**Q: 装 `[google]`（Gemini）后 pip 报 httpx 冲突：mootdx 要 `httpx<0.26`、google-genai 要 `httpx>=0.28`？**
-先澄清：**litellm / mcp 不是本项目的依赖**——报错里若提到它们，是你环境里其它包带来的，与 TradingAgents 无关。本项目核心安装（`pip install -e .`）不依赖 httpx≥0.28，**默认不冲突**；冲突只在装 `[google]` 用 Gemini 时出现（mootdx 与 google-genai 的 httpx 上下限互斥）。解法：① **mootdx 取行情走 TCP 协议、运行时根本不调用 httpx**，可让 httpx 升到满足 google-genai 的版本，pip 那条 `incompatible` 只是警告、不影响 mootdx 运行（实测 mootdx 0.11.7 在 httpx 0.28.1 下取数正常）；② 或把跑 Gemini 的环境与 mootdx 数据层分到不同 venv；③ 最省心是用 MiniMax / DeepSeek / 通义等国内直连模型，不装 `[google]` 就没这问题。
+**Q: 为什么没有 `[google]` extra 了？装 Gemini 报 httpx 冲突怎么办？**
+**v0.3.1 起移除了 `[google]` extra**（[#87](https://github.com/simonlin1212/TradingAgents-astock/issues/87)）。原因：`langchain-google-genai>=4.0.0` 要求 `google-genai>=1.53.0`，而该区间内**每一个** google-genai 版本都要求 `httpx>=0.28.1`；mootdx（核心 A 股数据源）钉死 `httpx>=0.25,<0.26`。**没有任何版本组合能同时满足，冲突是结构性的。**
+
+真正的问题是：**uv 构建的是覆盖所有 extra 的 universal lock**，所以只要这个 extra 存在，`uv sync` 就对**所有人**失败——包括从不用 Gemini 的用户。把 extra 留空更糟（`pip install .[google]` 会静默什么都不装，用户以为装好了）。所以直接移除，并在 `google_client.py` 导入失败时给出可直接执行的安装命令。
+
+需要 Gemini 时显式安装（**mootdx 取行情走 TCP 协议、运行时根本不 import httpx**，所以抬高 httpx 实测不影响取数）：
+
+```bash
+pip install --no-deps "langchain-google-genai>=4.0.0"
+pip install "google-genai>=1.53.0" "httpx>=0.28.1"
+```
+
+或把 Gemini 与数据层分到不同 venv。最省心是用 DeepSeek / MiniMax / 通义 / OpenAI 兼容中继等，完全不涉及这个冲突。
+
+另澄清：**litellm / mcp 不是本项目的依赖**——报错里若提到它们，是你环境里其它包带来的。
 
 **Q: 不进 CLI 交互，怎么批量跑多只标的、拿到和 CLI 一样的完整报告？**
 看 `examples/run_cases.py`：它复用 CLI 的 `save_report_to_disk()`，每只标的输出与 CLI 一致的 `complete_report.md`（分析师 / 研究 / 交易 / 风险 / 组合五个分区）+ 一份字段齐全的 `summary.json`。用法：`uv run python examples/run_cases.py`（跑全部）或 `uv run python examples/run_cases.py 688017`（单只）；改 `build_config()` 切换 provider/model。
@@ -386,33 +407,85 @@ TradingAgents-Astock/
 
 ---
 
-## 许可证
+## 项目定位
 
-[Apache License 2.0](./LICENSE)
+**这是一个框架的工程实现，不是一个投资产品。**
 
-本项目是 TauricResearch/TradingAgents 的 fork，继承 Apache 2.0 许可证。详见 [NOTICE](./NOTICE)。
+- **它是什么**：[TradingAgents 论文](https://arxiv.org/abs/2412.20138)（TauricResearch）多 Agent 架构的 A 股工程实现，用于研究与教学——研究多 Agent 辩论在金融文本上的行为、A 股数据源如何接入、结构化输出如何落地。
+- **它不是什么**：不是投资顾问、不是荐股软件、不提供任何投资服务。本仓库不发布针对具体证券的分析报告、评级或买卖建议；`examples/` 下只有可自行运行的脚本，没有任何预生成的个股结论。
+- **模型和数据都是你自己的**：你配置自己的 LLM API key，在自己的机器上运行，产出的内容归你所有、由你判断、由你负责。项目本身不托管服务、不代为分析、不接触你的运行结果。
+- **不产出可执行价位**：框架内**没有**建仓价 / 止损位 / 仓位 / 目标价这类输出——不是默认关闭，是代码里就没有。Trader 与 Portfolio Manager 只给方向、评级与理由。需要这类能力的使用者可以自行 fork 添加（Apache-2.0 允许），并自行承担相应责任、自行确认所在司法辖区的资质要求。
 
-## Donate
+> **⚠️ 免责声明**
+>
+> - 本系统产出的所有内容均由 AI 自动生成，可能存在错误或偏差
+> - 本项目不构成任何投资建议；投资决策请咨询持有中国证监会颁发资质的专业机构
+> - 作者不对使用本工具产生的任何投资损失承担责任
+> - 股市有风险，投资需谨慎
+
+---
+
+## 赞赏
 
 如果这个工具帮到了你的投研工作流，欢迎请作者喝杯咖啡 ☕
 
 <p align="center">
-  <img src="./assets/wechat-sponsor.jpg" width="240" alt="微信赞赏码">
-</p>
-<p align="center">
-  <a href="https://ifdian.net/a/simonlin">爱发电</a> ·
-  <a href="https://buymeacoffee.com/simonlin1212">Buy Me a Coffee</a>
+  <a href="https://buymeacoffee.com/simonlin1212"><img src="./assets/bmc-qr.png" width="180" alt="Buy Me a Coffee"></a>
 </p>
 
 > 想要什么功能？欢迎开 [Issue](https://github.com/simonlin1212/tradingagents-astock/issues) 提需求，赞助者的 Issue 优先处理。
 
 ---
 
-## 免责声明
+## License
 
-> **本项目仅供学习研究与技术演示，不构成任何投资建议。**
+[Apache License 2.0](./LICENSE)
+
+本项目是 TauricResearch/TradingAgents 的 fork，继承 Apache 2.0 许可证。详见 [NOTICE](./NOTICE)。
+
+**作者：** Simon 林 · X [@linsizhen](https://x.com/linsizhen) · 邮箱：[simonlin0423@gmail.com](mailto:simonlin0423@gmail.com)
+### 用个人 Claude 订阅额度（可选，v0.4.0 新增）
+
+让节点经 Claude Agent SDK 走你**个人 Claude Pro/Max 订阅额度**，而不是按 token 计费的 Anthropic API。
+
+> 与内置 `anthropic` provider 的区别：`anthropic` 走 `ANTHROPIC_API_KEY` = **按 token 计费**；本 provider 走本机已登录的 `claude` CLI = **消耗订阅额度，不产生 API 账单**。
 >
-> - 本系统产出的所有分析报告和交易信号均由 AI 自动生成，可能存在错误或偏差
-> - 投资决策请咨询持有中国证监会颁发资质的专业机构
-> - 作者不对使用本工具产生的任何投资损失承担责任
-> - 股市有风险，投资需谨慎
+> 仅供**个人自用**——它消耗的是你自己账号的订阅额度。把它做成给别人用的产品需要 Anthropic 授权，不在本项目范围内。
+
+#### 1. 准备
+
+```bash
+pip install -e ".[agentsdk]"
+
+# 本机 claude 已登录即可；headless / CI 环境需要显式 token：
+claude setup-token          # 输出的 token 设为 CLAUDE_CODE_OAUTH_TOKEN
+
+# 不打算保留付费降级的话，顺手清掉（可选）
+unset ANTHROPIC_API_KEY
+```
+
+关于 `ANTHROPIC_API_KEY`：它的优先级高于订阅凭据，**但不会泄进 Agent SDK 子进程**——客户端在子进程环境里已把它显式置空，订阅额度照常生效。父进程保留它是为了让 `anthropic` 仍能作为撞额度后的降级 provider（否则就成死结：留着启动被拦、删掉又在真要降级时认证失败）。启动时只告警不中止。
+
+#### 2. 开启
+
+Web UI 侧栏「个人 Claude 订阅覆盖 (Agent SDK)」三档，或在 config 里设：
+
+```python
+config["deep_think_provider_override"]  = "claude_agent_sdk"   # 仅深度节点
+config["quick_think_provider_override"] = "claude_agent_sdk"   # 再加这条 = 全节点
+config["agent_sdk_model"]       = "opus"      # 深度节点
+config["agent_sdk_quick_model"] = "sonnet"    # 分析师节点
+```
+
+**模型建议填别名 `opus` / `sonnet`**——`claude` CLI 的别名恒指向最新模型，写死 `claude-opus-4-8` 这类完整 id 会随版本迭代过期。完整 id 同样支持。
+
+#### 3. 两条边界
+
+- **额度而非 token**：订阅是按额度限流的。「所有节点」会把 7 个分析师 + 多空/交易员/风险辩手全压上去，跑几轮就可能撞上限——所以 `agent_sdk_quick_model` 默认给的是更省的 `sonnet`。撞额度会自动降级到你配的付费 provider（可用 `agent_sdk_fallback_provider` / `agent_sdk_fallback_model` 指定）。
+- **凭据失效不降级**：OAuth token 过期时**直接报错中止**，不会静默降级到计费 provider——你开订阅模式就是为了避免账单，悄悄开始计费比报错更糟。报错里会给出 `claude setup-token` 的修复步骤。
+
+#### 依赖说明
+
+`[agentsdk]` 的依赖链是 `claude-agent-sdk → mcp → httpx2`，**不碰 httpx**，与 mootdx 的 `httpx<0.26` 无冲突（已 `uv lock` 实测）——和 #87 里被移除的 `[google]` 情况不同，不需要单开 venv。
+
+

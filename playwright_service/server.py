@@ -732,8 +732,9 @@ def fetch_market_overview():
 @cached(ttl=60)
 def fetch_stock_kline_full(code: str, days: int = 120):
     """
-    通过 playwright 访问东财个股页面，获取含换手率的增强K线。
+    通过 playwright 访问东财个股/指数页面，获取含换手率的增强K线。
     K线格式: date, open, close, high, low, volume, amount, amplitude%, pctChg%, turnover%
+    支持指数代码（000/399 开头，如 000300 沪深300），指数页为 zs 前缀。
     """
     try:
         days = max(1, min(int(days), 10000))
@@ -753,7 +754,17 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                 page = await ctx.new_page()
                 await page.set_viewport_size({"width": 1280, "height": 800})
 
-                prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                # 指数识别：000/399 开头为指数。
+                # 沪市指数(000xxx): 上证/沪深300/科创50/中证500 → secid 1.xxx、zs 页面
+                # 深市指数(399xxx): 深成/创业板/国证2000    → secid 0.xxx、zs 页面
+                # 股票: 6/9 开头为沪市(secid 1.xxx、sh 页面)，其余为深市(secid 0.xxx、sz 页面)
+                is_index = code.startswith(("000", "399"))
+                if is_index:
+                    prefix = "zs"
+                    market_id = "1" if code.startswith("000") else "0"
+                else:
+                    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                    market_id = "1" if code.startswith(("6", "9")) else "0"
                 url = f"https://quote.eastmoney.com/{prefix}{code}.html"
 
                 # Eastmoney stock pages load K-line data for BOTH the requested

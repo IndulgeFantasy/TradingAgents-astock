@@ -67,6 +67,78 @@ from .reflection import Reflector
 from .signal_processing import SignalProcessor
 
 
+def _normalize_yfinance_ticker(ticker: str) -> str:
+    """Return the Yahoo Finance symbol for a ticker used by the graph.
+
+    A-stock decisions are stored with their six-digit code (for example
+    ``600519``), while Yahoo Finance requires an exchange suffix for mainland
+    China listings (``600519.SS``).  Without the suffix ``Ticker.history``
+    usually returns an empty frame, so deferred memory outcomes remain pending
+    indefinitely.  Common A-share prefixes/suffixes are normalized as well;
+    non-A-share symbols remain unchanged so the graph remains usable for other
+    markets too.
+    """
+    symbol = str(ticker).strip().upper()
+
+    # The A-stock layer accepts SH/SZ/BJ prefixes and uses .SH for Shanghai,
+    # whereas Yahoo uses .SS.  Normalize those forms before handling bare
+    # six-digit codes. Yahoo has no Beijing exchange suffix, so keep BJ codes
+    # unqualified instead of inventing a symbol that cannot return data.
+    if (
+        len(symbol) == 9
+        and symbol[:6].isdigit()
+        and symbol[6:] in (".SH", ".SZ", ".BJ")
+    ):
+        code, exchange = symbol[:6], symbol[7:]
+        if exchange == "SH":
+            return f"{code}.SS"
+        if exchange == "SZ":
+            return f"{code}.SZ"
+        return code
+    if (
+        len(symbol) == 8
+        and symbol[:2] in ("SH", "SZ", "BJ")
+        and symbol[2:].isdigit()
+    ):
+        code, exchange = symbol[2:], symbol[:2]
+        if exchange == "SH":
+            return f"{code}.SS"
+        if exchange == "SZ":
+            return f"{code}.SZ"
+        return code
+
+    if len(symbol) != 6 or not symbol.isdigit():
+        return symbol
+
+    # The 920xxx range is Beijing-listed; Yahoo has no supported suffix for it.
+    if symbol.startswith("92"):
+        return symbol
+    # Shanghai-listed A shares, B shares and ETFs use the .SS suffix on Yahoo.
+    if symbol.startswith(("5", "6", "9")):
+        return f"{symbol}.SS"
+    # Other Beijing-listed six-digit ranges are not covered by Yahoo either.
+    if symbol.startswith(("4", "8")):
+        return symbol
+    # Shenzhen-listed stocks (000/001/002/003/300/301, etc.).
+    return f"{symbol}.SZ"
+
+
+def _is_unsupported_by_yfinance(symbol: str) -> bool:
+    """True for codes Yahoo Finance has no coverage for at all.
+
+    Beijing Stock Exchange listings (920xxx current, 43x/83x/87x legacy) are
+    absent from Yahoo under every suffix — verified 2026-07-31: ``920002``,
+    ``920002.BJ``, ``920002.SS`` and ``920002.SZ`` all return an empty frame.
+    Retrying them every run only burns a request and leaves the memory entry
+    pending forever with no stated reason, so short-circuit and say why once.
+    """
+    return (
+        len(symbol) == 6
+        and symbol.isdigit()
+        and (symbol.startswith("92") or symbol[:2] in ("43", "83", "87"))
+    )
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -103,18 +175,80 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
-        deep_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["deep_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
-        )
-        quick_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["quick_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
-        )
+        # Optional: route nodes through a personal Claude Pro/Max subscription
+        # via the Claude Agent SDK. `deep_think_provider_override` covers the
+        # deep nodes (Research / Portfolio Manager); `quick_think_provider_override`
+        # covers the quick nodes (7 tool-using analysts + Bull/Bear / trader /
+        # risk debaters). Both on ⇒ every node runs on the subscription. Off by
+        # default — behaviour is unchanged when both are None.
+        deep_on = self.config.get("deep_think_provider_override") == "claude_agent_sdk"
+        quick_on = self.config.get("quick_think_provider_override") == "claude_agent_sdk"
+
+        # F-004 guardrail: ANTHROPIC_API_KEY outranks the subscription OAuth token
+        # and would silently bill the pay-per-token API instead of the subscription.
+        # Refuse to start rather than surprise-bill the user.
+        if (deep_on or quick_on) and os.getenv("ANTHROPIC_API_KEY"):
+            # 该 key 优先级高于订阅凭据，泄进 Agent SDK 子进程就会悄悄走按 token
+            # 计费的 API。客户端已在子进程环境里把它显式置空，所以这里**不再一律
+            # 中止**——否则把 anthropic 用作降级 provider 就成了死结：留着 key 启动
+            # 被拦，删掉 key 又会在撞额度真要降级时认证失败。
+            logger.warning(
+                "ANTHROPIC_API_KEY is set while the claude_agent_sdk override is on. "
+                "It is stripped from the Agent SDK subprocess so subscription quota is "
+                "used, and kept in this process only so an `anthropic` fallback can "
+                "still authenticate. If you did not intend to keep a paid Anthropic "
+                "fallback, unset it."
+            )
+
+        # 降级配置必须成对给：只改 provider 不改 model，会把主 provider 的模型名
+        # 配到另一家去（如 AnthropicClient(model="deepseek-chat")），而这条路径
+        # **恰好在撞额度、最需要它工作的时候才被走到**——那时再炸就太晚了。
+        # 启动时就校验，而不是留到运行中。
+        _fb_provider = self.config.get("agent_sdk_fallback_provider")
+        _fb_model = self.config.get("agent_sdk_fallback_model")
+        if (deep_on or quick_on) and bool(_fb_provider) != bool(_fb_model):
+            missing = "agent_sdk_fallback_model" if _fb_provider else "agent_sdk_fallback_provider"
+            given = "agent_sdk_fallback_provider" if _fb_provider else "agent_sdk_fallback_model"
+            raise ValueError(
+                f"{given} is set but {missing} is not — the two must be configured "
+                f"together. Otherwise the fallback pairs one provider with another "
+                f"provider's model name and fails exactly when the subscription hits "
+                f"its quota. Set both, or leave both unset to fall back to "
+                f"llm_provider + its own model."
+            )
+
+        def _make_client(override_on, sdk_model_key, fallback_model_key):
+            """Build a subscription-backed client when overridden, else the normal
+            llm_provider client. Fallback rejoins the paid provider on quota/failure."""
+            if override_on:
+                # backend_url 是为 llm_provider 配的端点。显式指定了**另一家**
+                # provider 做降级时不能把它带过去（例如把 anthropic 降级请求发到
+                # MiniMax 网关），否则同样是撞额度那一刻才炸。None ⇒ 该 provider
+                # 用自己的默认端点。
+                cross_provider = bool(_fb_provider) and _fb_provider != self.config["llm_provider"]
+                fallback_spec = {
+                    "provider": _fb_provider or self.config["llm_provider"],
+                    "model": _fb_model or self.config[fallback_model_key],
+                    "base_url": None if cross_provider else self.config.get("backend_url"),
+                    # 带上 callbacks：降级意味着**开始计费**，此时统计/成本回调
+                    # 反而看不到这些调用的话，恰好在花钱的时候统计是瞎的。
+                    **({"callbacks": self.callbacks} if self.callbacks else {}),
+                }
+                return create_llm_client(
+                    provider="claude_agent_sdk",
+                    model=self.config[sdk_model_key],
+                    base_url=self.config.get("backend_url"),
+                    fallback_spec=fallback_spec,
+                )
+            return create_llm_client(
+                provider=self.config["llm_provider"],
+                model=self.config[fallback_model_key],
+                base_url=self.config.get("backend_url"),
+                **llm_kwargs,
+            )
+
+        deep_client = _make_client(deep_on, "agent_sdk_model", "deep_think_llm")
+        quick_client = _make_client(quick_on, "agent_sdk_quick_model", "quick_think_llm")
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
@@ -258,33 +392,55 @@ class TradingAgentsGraph:
     ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
-        Uses A-stock direct HTTP APIs (Eastmoney push2his) instead of yfinance,
-        which is unreliable in China mainland networks.
+        Uses the playwright_service browser channel (Eastmoney pages) for K-line
+        data instead of direct HTTP, because Eastmoney push2his rejects direct
+        requests from non-browser clients (RemoteDisconnected).  The same channel
+        powers the get_stock_kline_full agent tool.
 
         Returns (raw_return, alpha_return, actual_holding_days) or
         (None, None, None) if price data is unavailable (too recent, delisted,
         or network error).
         """
         try:
-            from tradingagents.dataflows.a_stock import _em_fetch_klines, _normalize_ticker
-            from tradingagents.dataflows.utils import safe_ticker_component
+            from tradingagents.agents.utils.playwright_tools import _get_client
 
             code = safe_ticker_component(ticker)
             if not code or len(code) != 6:
                 return None, None, None
 
-            # Fetch enough K-lines to cover trade_date + holding_days
-            # 250 trading days ~ 1 year, enough to find any date within the last year
-            stock_klines = _em_fetch_klines(code, count=250)
-            # Benchmark: CSI 300 index (000300)
-            bench_klines = _em_fetch_klines("000300", count=250)
+            # 北交所（4/8开头）在部分行情源下数据不完整：提前警告，仍尝试获取
+            if code.startswith(("4", "8")):
+                logger.warning(
+                    "Cannot reliably resolve outcome for %s: %s is a Beijing Stock "
+                    "Exchange (BSE) ticker. Price data may be incomplete or delayed. "
+                    "Use a non-BSE ticker if you need reliable memory reflection.",
+                    ticker, code,
+                )
+
+            # holding_days 按交易日计；+15 条 buffer 应对节假日/停牌。
+            # 为覆盖最近约 1 年内任意 trade_date，至少拉 250 条。
+            fetch_count = max(holding_days + 15, 250)
+
+            client = _get_client()
+            # 个股与沪深300基准均走 playwright_service（浏览器通道，规避东财 push2his 直连风控）
+            stock_res = client.stock_kline_full(code, fetch_count)
+            bench_res = client.stock_kline_full("000300", fetch_count)
+
+            if not stock_res.get("success") or not bench_res.get("success"):
+                err = stock_res.get("error") or bench_res.get("error") or "unknown"
+                logger.warning(
+                    "Could not resolve outcome for %s on %s: K-line fetch failed: %s",
+                    ticker, trade_date, err,
+                )
+                return None, None, None
+
+            stock_klines = stock_res.get("data", []) or []
+            bench_klines = bench_res.get("data", []) or []
 
             if not stock_klines or not bench_klines:
                 return None, None, None
 
-            # Find the index of trade_date (or the closest trading day after it)
-            trade_date_str = trade_date.replace("-", "")
-            trade_date_iso = trade_date  # YYYY-MM-DD
+            start_dt = datetime.strptime(trade_date, "%Y-%m-%d")
 
             def _find_closest(klines, target_date):
                 """Find index of the first K-line on or after target_date."""
@@ -293,25 +449,33 @@ class TradingAgentsGraph:
                         return i
                 return None
 
-            stock_idx = _find_closest(stock_klines, trade_date_iso)
-            bench_idx = _find_closest(bench_klines, trade_date_iso)
+            stock_idx = _find_closest(stock_klines, trade_date)
+            bench_idx = _find_closest(bench_klines, trade_date)
 
             if stock_idx is None or bench_idx is None:
                 return None, None, None
 
-            # Need at least holding_days+1 records from the start point
-            stock_end = stock_idx + holding_days + 1
-            bench_end = bench_idx + holding_days + 1
+            # 守卫：数据窗口不够老 —— 当 trade_date 早于 K 线起点（或个股长期
+            # 停牌）时，_find_closest 会退化为 index 0，导致从错误起点计算收益。
+            # 允许 ≤15 个自然日的宽容（周末+节假日），超过则视为数据不足。
+            for klines, idx in ((stock_klines, stock_idx), (bench_klines, bench_idx)):
+                gap_days = (datetime.strptime(klines[idx]["date"], "%Y-%m-%d") - start_dt).days
+                if gap_days > 15:
+                    return None, None, None
 
-            if stock_end > len(stock_klines) or bench_end > len(bench_klines):
-                # Price data not available yet (too recent)
+            # 宽容模式：个股/基准可用天数取最小，数据略不足时也返回部分持有期结果
+            stock_available = len(stock_klines) - stock_idx - 1
+            bench_available = len(bench_klines) - bench_idx - 1
+            actual_days = min(holding_days, stock_available, bench_available)
+
+            if actual_days < 1:
+                # 连 1 个交易日的数据都不够（如 trade_date 就是最近交易日），下次再试
                 return None, None, None
 
-            actual_days = holding_days
             stock_start_price = stock_klines[stock_idx]["close"]
-            stock_end_price = stock_klines[stock_end - 1]["close"]
+            stock_end_price = stock_klines[stock_idx + actual_days]["close"]
             bench_start_price = bench_klines[bench_idx]["close"]
-            bench_end_price = bench_klines[bench_end - 1]["close"]
+            bench_end_price = bench_klines[bench_idx + actual_days]["close"]
 
             if stock_start_price <= 0 or bench_start_price <= 0:
                 return None, None, None
@@ -319,7 +483,9 @@ class TradingAgentsGraph:
             raw = float((stock_end_price - stock_start_price) / stock_start_price)
             bench_ret = float((bench_end_price - bench_start_price) / bench_start_price)
             alpha = raw - bench_ret
+
             return raw, alpha, actual_days
+
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s (will retry next run): %s",
