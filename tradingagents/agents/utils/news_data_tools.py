@@ -66,14 +66,17 @@ def get_insider_transactions(
     ticker: Annotated[str, "6-digit A-stock code (e.g. 600379). Must be numeric, NOT company name"],
 ) -> str:
     """
-    Retrieve executive/insider trading changes (高管/大股东增减持明细).
-    Data source: 东方财富 gdggcg, via playwright_service.
-    Returns change records with date, changer, direction (增持/减持), shares,
-    price, amount, reason, ratio, post-change holdings, and position.
+    Retrieve company events (公司大事) from 同花顺F10 event.html.
+    Returns: 近期重要事件(财报披露/公告/融资融券/大宗交易/业绩预告/股东大会/分红/回购/股权质押/股东增减持等),
+    高管持股变动(变动日期/变动人/与高管关系/变动数量/均价/剩余股数/变动途径),
+    股东持股变动(公告日期/变动股东/变动数量/均价/剩余股份/变动期间/途径),
+    担保明细(担保金额/期限/担保方/类型/被担保方),
+    违规处理(公告日期/处罚金额/处罚类型/处理人/处罚对象/违规行为/处罚说明),
+    机构调研(机构类别+调研机构名称列表).
     Args:
         ticker (str): 6-digit A-stock code, e.g. 600379
     Returns:
-        str: A report of executive/insider trading changes
+        str: Company events report
     """
     ok, code_or_message = _validate_a_stock_code("get_insider_transactions", ticker)
     if not ok:

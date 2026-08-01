@@ -1372,85 +1372,123 @@ def get_global_news(
 def get_insider_transactions(
     ticker: Annotated[str, "A-stock code"],
 ) -> str:
-    """Get insider/executive trading changes via 东方财富 gdggcg (playwright)."""
+    """Get company events (重要事件+高管持股变动+股东持股变动+担保+违规) via 同花顺F10 event.html."""
     code = _normalize_ticker(ticker)
 
-    # --- playwright: 东方财富 高管持股变动 ---
     try:
-        result = _executive_changes_playwright(code)
+        result = _company_events_playwright(code)
         if result is not None:
             return result
     except Exception as e:
-        logger.warning("playwright executive_changes failed for %s: %s", code, str(e)[:200])
+        logger.warning("playwright company_events failed for %s: %s", code, str(e)[:200])
 
-    return f"[高管持股变动] {code}: playwright_service 不可用，无法获取高管/大股东增减持明细。请确保 playwright_service 已启动。"
+    return f"[公司大事] {code}: playwright_service 不可用，无法获取公司大事数据。请确保 playwright_service 已启动。"
 
 
-def _executive_changes_playwright(code: str):
-    """Fetch executive/insider trading changes via playwright_service.
+def _company_events_playwright(code: str):
+    """Fetch company events via playwright_service (同花顺F10 event.html).
 
-    Returns rendered string, or None on failure (caller falls back to mootdx).
+    Returns rendered string, or None on failure.
     """
     try:
         from playwright_service.client import PlaywrightClient
         client = PlaywrightClient()
-        result = client.executive_changes(code)
+        result = client.company_events(code)
     except Exception as e:
-        logger.warning("playwright executive_changes transport failed for %s: %s", code, str(e)[:200])
+        logger.warning("playwright company_events transport failed for %s: %s", code, str(e)[:200])
         return None
 
     if not result or not result.get("success"):
         return None
 
     data = result.get("data", {}) or {}
-    changes = data.get("changes", []) or []
-    if not changes:
-        # 区分"确实无数据"和"接口失败"
-        if data.get("noData"):
-            return (
-                f"# 高管持股变动: {code}\n"
-                f"# 数据源: 东方财富 (gdggcg)\n"
-                f"# 该股票无高管/大股东增减持记录\n\n"
-                f"（东方财富页面显示「暂无数据」，表明该股票历史上无高管增减持公告记录）"
-            )
+    events = data.get("events", []) or []
+    exec_changes = data.get("executive_changes", []) or []
+    shareholder_changes = data.get("shareholder_changes", []) or []
+    guarantees = data.get("guarantees", []) or []
+    violations = data.get("violations", []) or []
+    research_visits = data.get("research_visits", []) or []
+
+    if not events and not exec_changes and not shareholder_changes and not guarantees and not violations and not research_visits:
         return None
 
     lines = [
-        f"# 高管持股变动: {code}",
-        f"# 数据源: 东方财富 (gdggcg)",
+        f"# 公司大事: {code}",
+        f"# 数据源: 同花顺F10 (event.html)",
         f"# 获取时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"# 共 {data.get('totalCount', len(changes))} 条变动记录",
         "",
     ]
 
-    # 汇总：增持/减持统计
-    increases = [c for c in changes if "增持" in c.get("变动方向", "")]
-    decreases = [c for c in changes if "减持" in c.get("变动方向", "")]
-    lines.append(f"## 变动汇总: 增持 {len(increases)} 次, 减持 {len(decreases)} 次")
+    # 1. 近期重要事件
+    if events:
+        lines.append(f"## 近期重要事件 ({len(events)} 条)")
+        lines.append(f"  {'日期':<12} {'事件描述'}")
+        lines.append("  " + "-" * 100)
+        for e in events[:20]:
+            lines.append(f"  {e.get('date','')[:10]:<12} {e.get('description','')[:100]}")
+        if len(events) > 20:
+            lines.append(f"  ... (共 {len(events)} 条，仅显示前 20 条)")
 
-    # 明细表
-    lines.append(f"\n## 持股变动明细 ({len(changes)} 条)")
-    lines.append(
-        f"  {'日期':<12} {'变动人':<10} {'方向':<6} {'变动股数':<14} "
-        f"{'均价':<8} {'变动金额':<12} {'变动原因':<12} {'职务':<16}"
-    )
-    lines.append("  " + "-" * 100)
-    for c in changes[:30]:
-        date = c.get("日期", "")[:10]
-        person = c.get("变动人", "")[:8]
-        direction = c.get("变动方向", "")[:4]
-        shares = c.get("变动股数（股）", c.get("变动股数", ""))[:12]
-        price = c.get("成交均价", "")[:6]
-        amount = c.get("变动金额(元)", c.get("变动金额", ""))[:10]
-        reason = c.get("变动原因", "")[:10]
-        position = c.get("职务", "")[:14]
-        lines.append(
-            f"  {date:<12} {person:<10} {direction:<6} {shares:<14} "
-            f"{price:<8} {amount:<12} {reason:<12} {position:<16}"
-        )
+    # 2. 高管持股变动
+    if exec_changes:
+        lines.append(f"\n## 高管持股变动 ({len(exec_changes)} 条)")
+        lines.append(f"  {'变动日期':<12} {'变动人':<10} {'与高管关系':<16} {'变动数量':<16} {'均价':<8} {'剩余股数':<12} {'变动途径'}")
+        lines.append("  " + "-" * 100)
+        for c in exec_changes[:30]:
+            lines.append(
+                f"  {c.get('date','')[:10]:<12} {c.get('person','')[:8]:<10} "
+                f"{c.get('relationship','')[:14]:<16} {c.get('change','')[:14]:<16} "
+                f"{c.get('price',''):<8} {c.get('remaining','')[:10]:<12} {c.get('method','')}"
+            )
+        if len(exec_changes) > 30:
+            lines.append(f"  ... (共 {len(exec_changes)} 条，仅显示前 30 条)")
 
-    if len(changes) > 30:
-        lines.append(f"  ... (共 {len(changes)} 条，仅显示前 30 条)")
+    # 3. 股东持股变动
+    if shareholder_changes:
+        lines.append(f"\n## 股东持股变动 ({len(shareholder_changes)} 条)")
+        lines.append(f"  {'公告日期':<12} {'变动股东':<20} {'变动数量':<16} {'均价':<8} {'剩余股份':<12} {'变动期间':<22} {'途径'}")
+        lines.append("  " + "-" * 110)
+        for c in shareholder_changes[:15]:
+            lines.append(
+                f"  {c.get('announcement_date','')[:10]:<12} {c.get('shareholder','')[:18]:<20} "
+                f"{c.get('change','')[:14]:<16} {c.get('price',''):<8} {c.get('remaining','')[:10]:<12} "
+                f"{c.get('period','')[:20]:<22} {c.get('method','')}"
+            )
+        if len(shareholder_changes) > 15:
+            lines.append(f"  ... (共 {len(shareholder_changes)} 条，仅显示前 15 条)")
+
+    # 4. 担保明细
+    if guarantees:
+        lines.append(f"\n## 担保明细 ({len(guarantees)} 条)")
+        for g in guarantees[:10]:
+            parts = []
+            if g.get("amount"): parts.append(g["amount"])
+            if g.get("period"): parts.append(g["period"])
+            if g.get("guarantor"): parts.append(g["guarantor"])
+            if g.get("type"): parts.append(g["type"])
+            if g.get("guaranteed"): parts.append(f"被担保: {g['guaranteed']}")
+            lines.append(f"  {' | '.join(parts)}")
+
+    # 5. 违规处理
+    if violations:
+        lines.append(f"\n## 违规处理 ({len(violations)} 条)")
+        for v in violations:
+            parts = []
+            if v.get("date"): parts.append(v["date"])
+            if v.get("fine"): parts.append(v["fine"])
+            if v.get("type"): parts.append(v["type"])
+            if v.get("handler"): parts.append(v["handler"])
+            if v.get("target"): parts.append(v["target"])
+            if v.get("reason"): parts.append(v["reason"])
+            if v.get("description"): parts.append(v["description"])
+            lines.append(f"  {' | '.join(parts)}")
+
+    # 6. 机构调研
+    research_visits = data.get("research_visits", []) or []
+    if research_visits:
+        lines.append(f"\n## 机构调研 ({len(research_visits)} 组)")
+        for r in research_visits:
+            lines.append(f"  {r.get('category','')}: {r.get('institutions','')[:100]}")
 
     return "\n".join(lines)
 

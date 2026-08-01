@@ -64,14 +64,13 @@ def get_concept_blocks(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
     """
-    Retrieve concept/sector/region blocks that a stock belongs to.
-    Shows industry (申万), concept themes (e.g. 机器人概念, 减速器), and region.
-    Each block includes current day's change percentage.
-    Uses the configured signal_data vendor.
+    Retrieve concept/sector blocks that a stock belongs to.
+    Default (a_stock): 百度股市通, returns industry + concepts + region with daily change.
+    Playwright: 问财(iwencai), returns 同花顺 concepts + 3-level industry classification.
     Args:
         ticker (str): A-stock code
     Returns:
-        str: Concept and sector block membership with daily changes
+        str: Concept and sector block membership
     """
     return route_to_vendor("get_concept_blocks", ticker)
 

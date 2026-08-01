@@ -1,6 +1,9 @@
 from langchain_core.messages import HumanMessage, RemoveMessage
 import logging
 
+_logger = logging.getLogger(__name__)
+
+
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import (
     get_stock_data

@@ -198,3 +198,7 @@ class PlaywrightClient:
     def executive_changes(self, code: str) -> dict:
         """高管持股变动 (东方财富): 高管/大股东增减持明细"""
         return self._get("/api/executive-changes", {"code": code})
+
+    def company_events(self, code: str) -> dict:
+        """公司大事 (同花顺F10): 重要事件+高管持股变动+股东持股变动+担保+违规"""
+        return self._get("/api/company-events", {"code": code})

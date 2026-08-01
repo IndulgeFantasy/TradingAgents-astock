@@ -1848,68 +1848,68 @@ def fetch_stock_industry_peers(code: str):
 
 
 def fetch_concept_blocks_wencai(code: str):
-    """通过问财查询个股所属概念板块"""
+    """通过问财查询个股所属概念板块（适配 v2 API，不再依赖 mcp_query_table）。"""
     import asyncio
     try:
         from playwright.async_api import async_playwright
-        from mcp_query_table import query as wc_query, QueryType, Site
 
         async def _do_query():
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
                 try:
                     ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = await ctx.new_page()
+                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                     await page.set_viewport_size({"width": 1280, "height": 800})
-                    df = await wc_query(page, f"{code}概念板块",
-                                         query_type=QueryType.CNStock,
-                                         site=Site.THS, max_page=1)
-                    if df is None or df.empty:
-                        return {"success": False, "error": "问财无返回数据"}
-                    cols = list(df.columns)
-                    # 找概念相关列
-                    concept_col = None
-                    for c in cols:
-                        if "概念" in c or "板块" in c:
-                            concept_col = c
-                            break
-                    result_data = {}
-                    result_data["_columns"] = cols
-                    # 提取所有列数据
-                    row = df.iloc[0].to_dict() if len(df) > 0 else {}
-                    code_val = row.get("code", "")
-                    name_val = row.get("股票名称", "")
-                    concepts = row.get(concept_col, []) if concept_col else []
-                    if isinstance(concepts, str):
-                        concepts = [c.strip() for c in concepts.split(",") if c.strip()]
-                    # 找行业列
-                    industry_col = None
-                    for c in cols:
-                        if "行业" in c and "分类" not in c:
-                            industry_col = c
-                            break
-                    industry = row.get(industry_col, "") if industry_col else ""
+
+                    data = await _fetch_wencai_page(page, f"{code}概念板块")
+                    comps = _extract_wencai_components(data)
+
+                    concepts = []
+                    industry = ""
+                    stock_name = ""
+                    stock_code = ""
+
+                    for comp in comps:
+                        cd = comp.get("data", {}) if isinstance(comp.get("data"), dict) else {}
+                        datas = cd.get("datas", [])
+                        if not datas:
+                            continue
+                        row = datas[0]
+
+                        concept_val = row.get("所属概念", [])
+                        if isinstance(concept_val, list):
+                            concepts = [c.strip() for c in concept_val if c]
+                        elif isinstance(concept_val, str):
+                            concepts = [c.strip() for c in concept_val.split(",") if c.strip()]
+
+                        ind_val = row.get("所属同花顺行业", [])
+                        if isinstance(ind_val, list):
+                            industry = " > ".join(ind_val)
+                        elif isinstance(ind_val, str):
+                            industry = ind_val
+
+                        stock_name = row.get("股票简称", "")
+                        stock_code = row.get("股票代码", code)
+
+                    if not concepts and not industry:
+                        return {"success": False, "error": "问财无返回概念数据"}
+
                     return {
                         "success": True,
                         "data": {
-                            "code": str(code_val).strip(),
-                            "name": str(name_val).strip(),
+                            "code": str(stock_code).strip(),
+                            "name": str(stock_name).strip(),
                             "concepts": concepts,
                             "industry": industry,
-                            "raw_columns": cols,
-                            "raw_row": {k: str(v)[:80] for k, v in row.items()},
                         },
                         "source": "问财(iwencai)",
                     }
                 finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                    pass  # CDP browser shared - don't close
 
         return asyncio.run(_do_query())
     except ImportError as e:
-        return {"success": False, "error": f"依赖缺失: {e}. 请运行: pip install mcp_query_table playwright"}
+        return {"success": False, "error": f"依赖缺失: {e}"}
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
@@ -2624,6 +2624,212 @@ def fetch_executive_changes(code: str):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+# ── fetch_company_events: 公司大事（同花顺 F10 event.html）──
+@cached(ttl=3600)
+def fetch_company_events(code: str):
+    """
+    通过 playwright 访问同花顺 F10 event 页面，提取:
+    1. 近期重要事件（日期+事件类型+描述，含财报披露/公告/融资融券/大宗交易/业绩披露/股东大会/分红/回购等）
+    2. 高管持股变动（变动日期/变动人/与公司高管关系/变动数量/交易均价/剩余股数/股份变动途径）
+    3. 股东持股变动（公告日期/变动股东/变动数量/交易均价/剩余股份总数/变动期间/变动途径）
+    4. 担保明细（序号/担保金额/币种/担保期限/担保方/担保类型/被担保方）
+    5. 违规处理（公告日期/处罚金额/处罚类型/处理人/处罚原因）
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 800})
+                await page.goto(
+                    f"https://basic.10jqka.com.cn/{code}/event.html",
+                    wait_until="domcontentloaded", timeout=20000
+                )
+                await page.wait_for_timeout(5000)
+
+                result = await page.evaluate("""() => {
+                    const tables = document.querySelectorAll('table');
+                    const out = {
+                        events: [],
+                        executive_changes: [],
+                        shareholder_changes: [],
+                        guarantees: [],
+                        violations: [],
+                        research_visits: []
+                    };
+
+                    // Helper: extract rows from table as array of cell-text arrays
+                    function extractRows(table) {
+                        const rows = [];
+                        for (const tr of table.querySelectorAll('tr')) {
+                            const cells = Array.from(tr.querySelectorAll('td, th')).map(c => c.textContent.trim());
+                            if (cells.length > 0) rows.push(cells);
+                        }
+                        return rows;
+                    }
+
+                    // Classify tables by their section heading
+                    const allH2 = document.querySelectorAll('h2');
+                    const h2List = Array.from(allH2);
+                    function sectionOf(table) {
+                        let section = '';
+                        for (const h of h2List) {
+                            if (h.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) {
+                                section = h.textContent.trim();
+                            } else {
+                                break;
+                            }
+                        }
+                        return section;
+                    }
+
+                    for (let i = 0; i < tables.length; i++) {
+                        const table = tables[i];
+                        const section = sectionOf(table);
+                        const rows = extractRows(table);
+                        if (rows.length < 1) continue;
+
+                        // 1. 近期重要事件: section含"近期重要事件"且2列(日期+描述)，无表头行
+                        // 注意: 页面可能将"今天"和"历史"拆成多个 table
+                        if (section.includes('近期重要事件') && rows[0].length === 2) {
+                            for (let r = 0; r < rows.length; r++) {
+                                if (rows[r].length >= 2) {
+                                    out.events.push({
+                                        date: rows[r][0],
+                                        description: rows[r][1].replace(/\\n/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 200)
+                                    });
+                                }
+                            }
+                        }
+
+                        // 2. 高管持股变动: header含"变动日期"+"变动人"
+                        else if (section.includes('高管持股变动') || (rows[0].join('').includes('变动日期') && rows[0].join('').includes('变动人') && rows[0].join('').includes('高管关系'))) {
+                            const headers = rows[0];
+                            for (let r = 1; r < rows.length; r++) {
+                                if (rows[r].length >= 6) {
+                                    out.executive_changes.push({
+                                        date: rows[r][0],
+                                        person: rows[r][1],
+                                        relationship: rows[r][2],
+                                        change: rows[r][3].replace(/\\s+/g, ' ').trim(),
+                                        price: rows[r][4],
+                                        remaining: rows[r][5],
+                                        method: rows[r][6] || ''
+                                    });
+                                }
+                            }
+                        }
+
+                        // 3. 股东持股变动: header含"变动股东"
+                        else if (section.includes('股东持股变动') || rows[0].join('').includes('变动股东')) {
+                            const headers = rows[0];
+                            for (let r = 1; r < rows.length; r++) {
+                                if (rows[r].length >= 5) {
+                                    out.shareholder_changes.push({
+                                        announcement_date: rows[r][0],
+                                        shareholder: rows[r][1] || '',
+                                        change: (rows[r][2] || '').replace(/\\s+/g, ' ').trim(),
+                                        price: rows[r][3] || '',
+                                        remaining: rows[r][4] || '',
+                                        period: rows[r][5] || '',
+                                        method: rows[r][6] || ''
+                                    });
+                                }
+                            }
+                        }
+
+                        // 4. 担保明细: header含"担保金额"
+                        else if (section.includes('担保明细') || rows[0].join('').includes('担保金额')) {
+                            const cells0 = rows[0];
+                            const cells1 = rows.length > 1 ? rows[1] : [];
+                            const allCells = [...cells0, ...cells1];
+                            const guarantee = {};
+                            for (let c = 0; c < allCells.length; c++) {
+                                const t = allCells[c];
+                                if (t.includes('序') && t.includes('号')) guarantee.seq = t;
+                                else if (t.includes('担保金额')) guarantee.amount = t;
+                                else if (t.includes('币种')) guarantee.currency = t;
+                                else if (t.includes('担保期限')) guarantee.period = t;
+                                else if (t.includes('担') && t.includes('保') && t.includes('方')) guarantee.guarantor = t;
+                                else if (t.includes('担保类型')) guarantee.type = t;
+                                else if (t.includes('被担保方')) guarantee.guaranteed = t;
+                            }
+                            if (Object.keys(guarantee).length > 0) out.guarantees.push(guarantee);
+                        }
+
+                        // 5. 违规处理: header含"处罚"，数据跨多行
+                        else if (section.includes('违规处理') || rows[0].join('').includes('处罚')) {
+                            const violation = {};
+                            for (let r = 0; r < rows.length; r++) {
+                                for (let c = 0; c < rows[r].length; c++) {
+                                    const t = rows[r][c];
+                                    if (t.includes('公告日期')) violation.date = t;
+                                    else if (t.includes('处罚金额')) violation.fine = t;
+                                    else if (t.includes('处罚类型')) violation.type = t;
+                                    else if (t.includes('处理人')) violation.handler = t;
+                                    else if (t.includes('处罚对象')) violation.target = t;
+                                    else if (t.includes('违规行为')) violation.reason = t;
+                                    else if (t.includes('处罚说明')) violation.description = t.replace(/\\n/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 200);
+                                }
+                            }
+                            if (Object.keys(violation).length > 0) out.violations.push(violation);
+                        }
+
+                        // 6. 机构调研: header含"机构类别"+"调研机构"
+                        else if (section.includes('机构调研') || rows[0].join('').includes('机构类别')) {
+                            for (let r = 1; r < rows.length; r++) {
+                                if (rows[r].length >= 2) {
+                                    const category = rows[r][0];
+                                    const institutions = rows[r][1].replace(/查看更多|收起更多/g, '').replace(/\\n/g, ' ').replace(/\\s+/g, ' ').trim();
+                                    if (category && institutions) {
+                                        out.research_visits.push({
+                                            category: category,
+                                            institutions: institutions.slice(0, 300)
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    return out;
+                }""")
+
+                # 检查是否有数据
+                total = (len(result.get("events", [])) + len(result.get("executive_changes", [])) +
+                         len(result.get("shareholder_changes", [])) + len(result.get("guarantees", [])) +
+                         len(result.get("violations", [])) + len(result.get("research_visits", [])))
+                if total == 0:
+                    return {"success": False, "error": f"event.html 无 {code} 数据"}
+
+                return {
+                    "success": True,
+                    "data": {
+                        "code": code,
+                        **result,
+                    },
+                    "source": "同花顺F10",
+                }
+
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 # ── API 路由表 ──
 ROUTES = {
     "/api/fund-flow":            ("个股资金流+概念(问财)",   fetch_fund_flow_wencai, ["code"]),
@@ -2641,6 +2847,7 @@ ROUTES = {
     "/api/wencai-all":           ("问财全数据(问财)",        fetch_wencai_all, ["code"]),
     "/api/eps-forecast":         ("EPS一致预期(同花顺F10)",  fetch_eps_forecast, ["code"]),
     "/api/executive-changes":    ("高管持股变动(东方财富)",  fetch_executive_changes, ["code"]),
+    "/api/company-events":       ("公司大事(同花顺F10)",    fetch_company_events, ["code"]),
 }
 
 

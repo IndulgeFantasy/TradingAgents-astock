@@ -56,5 +56,6 @@ DEFAULT_CONFIG = {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
         "get_fund_flow": "playwright",  # 问财版含 DDE 散户数量趋势
         "get_profit_forecast": "playwright",  # 同花顺F10详细版（轻量直连HTTP易被反爬）
+        "get_concept_blocks": "playwright",  # 问财版含三级行业分类+同花顺概念
     },
 }
