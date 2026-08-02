@@ -836,8 +836,9 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                 if not klines:
                     return {"success": False, "error": "K线数据为空"}
 
-                # 页面默认只加载约120根日K（半屏窗口），若请求天数更多，则通过浏览器上下文
-                # (page.request, Chrome 网络栈+身份) 用相同 URL 重新请求 lmt=days 的完整历史。
+                # 页面默认只加载约120根日K（半屏窗口），且 chart 请求的是前复权(fqt=1)数据。
+                # 若请求天数更多，则通过浏览器上下文 (page.request, Chrome 网络栈+身份)
+                # 用相同 URL 重新请求 lmt=days、fqt=0(不复权，筹码分布标准) 的完整历史。
                 # push2his 会封 python-requests 指纹，直接 requests.get 会被断连。
                 if len(klines) < days and captured_url:
                     try:
@@ -845,11 +846,12 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                         _u = _up.urlsplit(captured_url)
                         _qs = _up.parse_qs(_u.query)
                         _qs["lmt"] = [str(days)]
+                        _qs["fqt"] = ["0"]
                         _long_url = _up.urlunsplit(
                             (_u.scheme, _u.netloc, _u.path, _up.urlencode(_qs, doseq=True), ""))
-                        _resp = await page.request.get(_long_url, timeout=20000)
+                        _resp = await page.request.get(_long_url, timeout=25000)
                         if _resp.ok:
-                            _d = _json.loads(_re.sub(r'^\w+\(|\)[^)]*$', '', _resp.text()))
+                            _d = _json.loads(_re.sub(r'^\w+\(|\)[^)]*$', '', await _resp.text()))
                             _k2 = _d.get("data", {}).get("klines", []) or []
                             if len(_k2) > len(klines):
                                 klines = _k2
