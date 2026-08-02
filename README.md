@@ -139,7 +139,7 @@
 
 > **数据源优先级 & 东财防封（v0.2.19 加 threading.Lock 线程安全）**：行情 / K线 / 市值 / 财务能从 mootdx（通达信 TCP，不封 IP）或腾讯拿到的，一律走它们；东财只用于它独有的数据（龙虎榜 / 解禁 / 资金流 / 板块 / 个股新闻 / 筹码分布 / 涨停池等）。所有东财请求统一走内置节流入口 `_em_get()`：`threading.Lock` 保护串行限流（默认间隔 ≥1s + 0.1~0.5s 随机抖动）+ 复用 Keep-Alive 会话，Web UI 多 analyst 并发安全。批量场景可设环境变量 `EM_MIN_INTERVAL=1.5~2` 降速。
 
-> **playwright_service 数据服务（可选）**：同花顺F10/问财等纯前端渲染页面需要独立 HTTP 服务（`playwright_service/`，跑在 worktrade2 conda 环境）。主程序通过 `PlaywrightClient` HTTP 调用，不直接依赖 playwright 库。内置熔断器保护（5次连续失败后熔断60秒）。未启动时自动降级到 a_stock 直连 HTTP 数据源。
+> **playwright_service 数据服务（必选）**：同花顺F10/问财等纯前端渲染页面需要独立 HTTP 服务（`playwright_service/`，跑在 worktrade2 conda 环境）。主程序通过 `PlaywrightClient` HTTP 调用，不直接依赖 playwright 库。内置熔断器保护（5次连续失败后熔断60秒）。未启动时自动降级到 a_stock 直连 HTTP 数据源。
 
 ## 快速开始
 
