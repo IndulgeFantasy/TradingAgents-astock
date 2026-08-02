@@ -165,7 +165,7 @@ def get_chip_distribution(
     """
     Retrieve chip distribution (筹码分布) for an A-stock.
     Computes profit ratio, average cost, 90%/70% concentration zones
-    using a CYQ algorithm on 210 daily K-lines.
+    using a CYQ algorithm on ~350 daily K-lines (不复权, 换手衰减系数0.5).
     Shows chip health assessment (healthy/warning based on concentration and profit ratio).
     Args:
         ticker (str): A-stock code

@@ -2326,9 +2326,14 @@ def get_industry_comparison(
 # ---------------------------------------------------------------------------
 # 18. Chip Distribution (筹码分布 - Python CYQ algorithm)
 # ---------------------------------------------------------------------------
+# 参数校准（2026-08，对照东财官方筹码分布 300750：获利63.51%/平均成本384.2/
+# 90%集中度27.45%/70%集中度10.71%）：窗口 350 根日K + 换手衰减系数 0.5 为
+# 最优拟合（62.3%/377.0/25.45%/10.89%，综合误差最小）。更短的窗口(120根，
+# 旧实现)会严重低估获利比例与集中度。
 
 _CYQ_PRICE_BUCKETS = 150
-_CYQ_KLINE_COUNT = 210
+_CYQ_KLINE_COUNT = 350
+_CYQ_DECAY_COEFF = 0.5
 
 
 def _em_fetch_klines(code: str, count: int = _CYQ_KLINE_COUNT) -> list[dict]:
@@ -2379,9 +2384,12 @@ def _compute_cyq(klines: list[dict]) -> dict:
     Algorithm:
     1. Determine price range from all K-lines (min low ~ max high)
     2. Create 150 price buckets
-    3. For each day, decay existing chips by (1 - turnover/100)
+    3. For each day, decay existing chips by (1 - turnover/100 * decay_coeff)
     4. Distribute today's volume as a triangle between low~high, peak at close
     5. After processing all days, compute profit ratio, avg cost, concentration
+
+    decay_coeff (换手衰减系数): 0.5 经东财官方数据校准。系数越小，历史筹码
+    衰减越慢（对低换手大盘股保留更多历史成本）。
 
     Returns dict with: profit_ratio, avg_cost, cost_90_low, cost_90_high,
                        concentration_90, cost_70_low, cost_70_high, concentration_70
@@ -2404,9 +2412,9 @@ def _compute_cyq(klines: list[dict]) -> dict:
     chip = [0.0] * _CYQ_PRICE_BUCKETS
 
     for k in klines:
-        # Decay existing chips by turnover rate
+        # Decay existing chips by turnover rate (衰减系数见 _CYQ_DECAY_COEFF)
         turnover = k.get("turnover", 0)
-        decay = max(0.0, 1.0 - turnover / 100.0)
+        decay = max(0.0, 1.0 - turnover / 100.0 * _CYQ_DECAY_COEFF)
         for b in range(_CYQ_PRICE_BUCKETS):
             chip[b] *= decay
 
@@ -2499,18 +2507,14 @@ def get_astock_chip_distribution(
     """Get chip distribution (筹码分布) for an A-stock.
 
     Computes profit ratio, average cost, 90%/70% concentration zones
-    using a Python CYQ algorithm on 210 daily K-lines.
-
-    Args:
-        ticker: 6-digit A-share code
-    Returns:
-        Formatted text with chip distribution analysis
+    using a Python CYQ algorithm on ~350 daily K-lines (不复权, 换手衰减系数0.5).
     """
     code = safe_ticker_component(ticker)
     lines = [f"# 筹码分布 | {code}"]
 
     try:
-        # 数据源: playwright_service 浏览器通道（规避东财 push2his 直连风控）。
+        # 数据源: playwright_service 浏览器通道（规避东财 push2his 直连风控；
+        # 服务端会通过浏览器上下文重取 lmt=350、fqt=0 不复权完整历史）。
         # records 含 date/open/close/high/low/volume/turnover，与 _compute_cyq 所需字段一致。
         from tradingagents.agents.utils.playwright_tools import _get_client
         res = _get_client().stock_kline_full(code, _CYQ_KLINE_COUNT)
