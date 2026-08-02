@@ -2256,59 +2256,67 @@ def get_industry_comparison(
     """Get industry sector performance comparison.
 
     Args:
-        ticker: 6-digit A-share code (used to identify relevant sector)
-        trade_date: YYYY-MM-DD
+        ticker: 6-digit A-share code
+        trade_date: YYYY-MM-DD (reference date shown in report header)
         top_n: number of top/bottom industries to show (default 20)
 
     Returns:
-        Formatted text with sector performance ranking, highlighting
-        the sector the target stock belongs to.
+        Formatted markdown: industry board ranking (top gainers / bottom losers)
+        with rank, latest index, change amount, change %, total market cap,
+        turnover, up/down stock counts and leading stock, scraped from the
+        Eastmoney gridlist#industry_board_2 page via playwright_service.
     """
     code = safe_ticker_component(ticker)
     lines = [f"# 行业横向对比 | {code} | {trade_date}"]
 
-    # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
+    # 东财行业板块页面爬取 (playwright_service, 直连 HTTP 被封)
     try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": "1",
-            "pz": "100",
-            "po": "1",
-            "np": "1",
-            "fltt": "2",
-            "invt": "2",
-            "fs": "m:90+t:2",
-            "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
-        }
-        r = _em_get(url, params=params, timeout=15)
-        d = r.json()
-        items = d.get("data", {}).get("diff", [])
-
-        if items:
-            lines.append(
-                f"\n## 全行业表现 (东财 {len(items)} 个行业)"
-            )
-            lines.append(
-                "排名 | 行业 | 涨跌幅 | 上涨 | 下跌 | 领涨股"
-            )
-            for i, item in enumerate(items):
-                name = item.get("f14", "")
-                change_pct = item.get("f3", 0)
-                up_count = item.get("f104", 0)
-                down_count = item.get("f105", 0)
-                leader = item.get("f140", "")
-                lines.append(
-                    f"  {i+1}. {name} "
-                    f"| {change_pct}% "
-                    f"| {up_count} "
-                    f"| {down_count} "
-                    f"| {leader}"
-                )
-                if i >= top_n * 2 - 1:
-                    lines.append(f"  ... (showing top/bottom {top_n})")
-                    break
+        from playwright_service.client import PlaywrightClient
+        client = PlaywrightClient()
+        result = client.industry_board(top_n)
+        if not result.get("success"):
+            lines.append(f"行业对比查询失败: {result.get('error', '')}")
         else:
-            lines.append("行业数据获取为空。")
+            top = result.get("top", [])
+            bottom = result.get("bottom", [])
+            total = result.get("total_industries", 0)
+            if top or bottom:
+                lines.append(
+                    f"\n## 全行业表现 (东财 {total} 个行业, 官方板块指数口径, 按涨跌幅降序)"
+                )
+                lines.append("排名 | 行业 | 最新价 | 涨跌额 | 涨跌幅 | 总市值 | 换手率 | 上涨 | 下跌 | 领涨股")
+
+                def _fmt(v, plus=False, suffix=""):
+                    if v is None:
+                        return "--"
+                    try:
+                        f = f"{float(v):+.2f}" if plus else f"{float(v):.2f}"
+                    except (ValueError, TypeError):
+                        return "--"
+                    return f + suffix
+
+                def _render_section(title, items):
+                    lines.append(title)
+                    for item in items:
+                        leader = item.get("leader_name", "")
+                        lchg = item.get("leader_chg")
+                        if lchg is not None:
+                            leader += f" {lchg:+.2f}%"
+                        lines.append(
+                            f"  {item.get('rank') or '?'} {item.get('name', '')} "
+                            f"| {_fmt(item.get('price'))} "
+                            f"| {_fmt(item.get('change'), plus=True)} "
+                            f"| {_fmt(item.get('chg'), plus=True, suffix='%')} "
+                            f"| {item.get('mktcap', '')} "
+                            f"| {_fmt(item.get('turnover'), suffix='%')} "
+                            f"| {item.get('up', 0)} | {item.get('down', 0)} "
+                            f"| {leader}"
+                        )
+
+                _render_section("### 涨幅居前:", top)
+                _render_section("### 跌幅居前:", bottom)
+            else:
+                lines.append("行业数据获取为空。")
     except Exception as e:
         lines.append(f"行业对比查询失败: {e}")
 

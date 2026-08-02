@@ -145,10 +145,12 @@ def get_industry_comparison(
 ) -> str:
     """
     Retrieve industry sector performance comparison (行业横向对比).
-    Shows all 90 THS industries ranked by performance with turnover,
-    net capital flow, and leading stocks. Useful for sector rotation analysis.
+    Eastmoney official industry board ranking (~128 sectors, gridlist#industry_board_2)
+    sorted by daily change %: rank, latest index value, change amount, change %,
+    total market cap, turnover, up/down stock counts, and leading stock with its
+    change %. Useful for sector rotation and valuation benchmarking.
     Args:
-        ticker (str): A-stock code (used to identify relevant sector)
+        ticker (str): A-stock code
         curr_date (str): Date in YYYY-MM-DD format
     Returns:
         str: Industry performance ranking with key metrics

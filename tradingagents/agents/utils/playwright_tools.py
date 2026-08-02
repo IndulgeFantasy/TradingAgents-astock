@@ -640,6 +640,67 @@ def get_stock_levels(
 # These provide richer data than the a_stock direct-HTTP versions.
 # ═══════════════════════════════════════════════════════════════
 
+@tool("get_industry_hotmap")
+def get_industry_hotmap(
+    level: str = "bk2",
+    top_n: int = 20,
+) -> str:
+    """获取大盘星图行业热力（全市场个股按行业聚合排名，判断板块轮动/主力资金集中度）。数据源: 东财大盘星图。
+
+    Args:
+        level: 行业层级 bk1(一级31个)/bk2(二级128个)/bk3(三级337个)，默认 bk2
+        top_n: 返回涨跌幅加权前 top_n 与后 top_n 个行业（默认 20）
+
+    返回每个行业: 涨跌家数/流通市值加权涨跌幅(近似)/主力净占比均值/换手率均值/领涨领跌股。
+    注意: 行业涨跌幅为个股流通市值加权近似值，与东财官方板块指数口径存在偏差。
+    """
+    try:
+        client = _get_client()
+        result = client.industry_hotmap(level, top_n)
+        if not result.get("success"):
+            return f"[行业热力] 获取失败: {result.get('error', '')}"
+        lines = [
+            f"# 大盘星图行业热力 (东财) | {result.get('level', level)} | 共 {result.get('total_industries', 0)} 个行业",
+            f"# 行情时间: {_now()}",
+            "",
+            "# 说明: 行业涨跌幅为个股流通市值加权近似值（非官方板块指数口径）",
+            "",
+        ]
+        top = result.get("top", [])
+        bottom = result.get("bottom", [])
+        if top:
+            lines.append(f"## 涨幅居前 {len(top)} 个行业")
+            lines.append(f"  {'行业':<12} {'涨跌幅':<8} {'涨/跌家数':<10} {'主力净占比':<10} {'换手率':<8} {'领涨股'}")
+            lines.append("  " + "-" * 78)
+            for it in top:
+                chg = _fmt_num(it.get("chg"), '+.2f', "N/A") + "%" if it.get("chg") is not None else "N/A"
+                zljzb = _fmt_num(it.get("zljzb"), '+.2f', "N/A") + "%" if it.get("zljzb") is not None else "N/A"
+                turn = _fmt_num(it.get("turnover"), '.2f', "N/A") + "%" if it.get("turnover") is not None else "N/A"
+                lines.append(
+                    f"  {it.get('name',''):<12} {chg:<8} "
+                    f"{it.get('up',0)}/{it.get('down',0):<7} {zljzb:<10} {turn:<8} "
+                    f"{it.get('leader','')}"
+                )
+        if bottom:
+            lines.append(f"\n## 涨幅垫底 {len(bottom)} 个行业")
+            lines.append(f"  {'行业':<12} {'涨跌幅':<8} {'涨/跌家数':<10} {'主力净占比':<10} {'换手率':<8} {'领跌股'}")
+            lines.append("  " + "-" * 78)
+            for it in bottom:
+                chg = _fmt_num(it.get("chg"), '+.2f', "N/A") + "%" if it.get("chg") is not None else "N/A"
+                zljzb = _fmt_num(it.get("zljzb"), '+.2f', "N/A") + "%" if it.get("zljzb") is not None else "N/A"
+                turn = _fmt_num(it.get("turnover"), '.2f', "N/A") + "%" if it.get("turnover") is not None else "N/A"
+                lines.append(
+                    f"  {it.get('name',''):<12} {chg:<8} "
+                    f"{it.get('up',0)}/{it.get('down',0):<7} {zljzb:<10} {turn:<8} "
+                    f"{it.get('lagger','')}"
+                )
+        if len(lines) <= 4:
+            return "[行业热力] 无数据"
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[行业热力] 获取异常: {e}"
+
+
 def get_concept_blocks_playwright(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:

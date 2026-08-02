@@ -59,3 +59,4 @@ python playwright_service/server.py [--port 8765]
 | `/api/stock-levels` | code | 支撑位/压力位 | 问财 kline2 |
 | `/api/wencai-all` | code | 问财全数据 | 问财 |
 | `/api/eps-forecast` | code | EPS一致预期 | 同花顺F10 worth |
+| `/api/industry-hotmap` | level, top_n | 大盘星图行业热力(全市场个股按行业聚合) | 东财 stockhotmap |

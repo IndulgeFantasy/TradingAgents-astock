@@ -814,9 +814,11 @@ def fetch_stock_kline_full(code: str, days: int = 120):
 
                 # Select the stock's K-line response, not the index comparison data.
                 captured = None
+                captured_url = None
                 for resp_url, data in captured_list:
                     if expected_secid in resp_url:
                         captured = data
+                        captured_url = resp_url
                         break
                 if captured is None:
                     # Fallback: match by code field in the response payload.
@@ -824,14 +826,35 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                         resp_code = str(data.get("data", {}).get("code", ""))
                         if resp_code == code:
                             captured = data
+                            captured_url = resp_url
                             break
                 if captured is None:
                     # Last resort: use the first captured response.
-                    captured = captured_list[0][1]
+                    captured, captured_url = captured_list[0]
 
                 klines = captured.get("data", {}).get("klines", [])
                 if not klines:
                     return {"success": False, "error": "K线数据为空"}
+
+                # 页面默认只加载约120根日K（半屏窗口），若请求天数更多，则通过浏览器上下文
+                # (page.request, Chrome 网络栈+身份) 用相同 URL 重新请求 lmt=days 的完整历史。
+                # push2his 会封 python-requests 指纹，直接 requests.get 会被断连。
+                if len(klines) < days and captured_url:
+                    try:
+                        import re as _re, json as _json, urllib.parse as _up
+                        _u = _up.urlsplit(captured_url)
+                        _qs = _up.parse_qs(_u.query)
+                        _qs["lmt"] = [str(days)]
+                        _long_url = _up.urlunsplit(
+                            (_u.scheme, _u.netloc, _u.path, _up.urlencode(_qs, doseq=True), ""))
+                        _resp = await page.request.get(_long_url, timeout=20000)
+                        if _resp.ok:
+                            _d = _json.loads(_re.sub(r'^\w+\(|\)[^)]*$', '', _resp.text()))
+                            _k2 = _d.get("data", {}).get("klines", []) or []
+                            if len(_k2) > len(klines):
+                                klines = _k2
+                    except Exception:
+                        pass
 
                 # K线格式: date, open, close, high, low, volume, amount, amplitude, pctChg, ?, turnover
                 records = []
@@ -2841,6 +2864,359 @@ def fetch_company_events(code: str):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+# ── fetch_industry_hotmap: 大盘星图行业热力 (东财 stockhotmap) ──
+# 全市场个股 → 三级行业归属聚合。数据源: quote.eastmoney.com/stockhotmap 页面的
+# getmcode/getquotebasedata/getquotedata 三个 API（绕过 push2 风控），其中约 5%
+# 个股行经过 AES 加密，需在页面内用 CryptoJS 解密（密钥 = Datas 头 + mcode 尾段）。
+@cached(ttl=120)
+def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20):
+    """获取大盘星图行业热力数据（全市场个股按三级行业聚合）。
+
+    level: bk1(一级行业) / bk2(二级行业) / bk3(三级行业)
+    top_n: 返回涨跌幅加权前 top_n 与后 top_n 个行业（默认 20）
+
+    Returns per-industry: 行业名/代码、个股数、上涨/下跌家数、
+    流通市值加权涨跌幅(近似)、主力净占比均值、换手率均值、领涨/领跌股。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    if level not in ("bk1", "bk2", "bk3"):
+        level = "bk2"
+    try:
+        top_n = max(1, min(int(top_n), 100))
+    except (ValueError, TypeError):
+        top_n = 20
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 900})
+                await page.goto(
+                    "https://quote.eastmoney.com/stockhotmap/",
+                    wait_until="domcontentloaded", timeout=20000,
+                )
+                await page.wait_for_timeout(4000)
+
+                payload = await page.evaluate("""async () => {
+                    const mcodeResp = await fetch('api/getmcode', {method:'POST'});
+                    const {mcode} = await mcodeResp.json();
+                    const baseResp = await fetch('api/getquotebasedata');
+                    const base = await baseResp.json();
+                    const quoteResp = await fetch('api/getquotedata?' +
+                        new URLSearchParams({quotedata_hash: base.hash || ''}));
+                    const datas = quoteResp.headers.get('Datas') || '';
+                    const quote = await quoteResp.json();
+                    const encRows = quote.data.filter(r => r.indexOf('|') < 0);
+                    const key = datas + mcode.split('|').slice(1).join('|');
+                    const decrypted = encRows.map(e => {
+                        try { return CryptoJS.AES.decrypt(e, key).toString(CryptoJS.enc.Utf8); }
+                        catch (err) { return null; }
+                    });
+                    return { base, quote, decrypted };
+                }""")
+
+                base = payload.get("base", {})
+                quote = payload.get("quote", {})
+                decrypted = payload.get("decrypted", [])
+                if not base or not quote:
+                    return {"success": False, "error": "大盘星图数据为空"}
+
+                def _parse(row):
+                    o = row.split("|")
+                    if len(o) < 17:
+                        return None
+                    try:
+                        zdf = float(o[3]) / 100.0 if o[3] not in ("-", "") else None
+                        ltsz = float(o[13]) if o[13] not in ("-", "") else None
+                        hsl = float(o[11]) / 100.0 if o[11] not in ("-", "") else None
+                        zljzb = float(o[16]) / 100.0 if o[16] not in ("-", "") else None
+                    except (ValueError, TypeError):
+                        return None
+                    return {"market": o[0], "code": o[1], "zdf": zdf,
+                            "ltsz": ltsz, "hsl": hsl, "zljzb": zljzb}
+
+                # merge plaintext + decrypted rows by market|code
+                merged = {}
+                for row in quote.get("data", []):
+                    r = _parse(row)
+                    if r:
+                        merged[(r["market"], r["code"])] = r
+                for drow in decrypted:
+                    if drow:
+                        r = _parse(drow)
+                        if r:
+                            merged[(r["market"], r["code"])] = r
+
+                # baseinfo: bk1_idx|bk2_idx|bk3_idx|name|market|code|labels
+                bk_idx = {"bk1": 0, "bk2": 1, "bk3": 2}[level]
+                bk_list = {k: [x.split("|") for x in base.get(k, [])]
+                           for k in ("bk1", "bk2", "bk3")}
+                stock_bk = {}
+                for row in base.get("baseinfo", []):
+                    p = row.split("|")
+                    if len(p) >= 7:
+                        stock_bk[(p[4], p[5])] = int(p[bk_idx])
+
+                from collections import defaultdict
+                agg = defaultdict(lambda: {"n": 0, "up": 0, "down": 0,
+                                           "chg_w": 0.0, "ltsz": 0.0,
+                                           "zljzb_sum": 0.0, "zljzb_n": 0,
+                                           "hsl_sum": 0.0, "hsl_n": 0,
+                                           "leader": None, "leader_zdf": -999.0,
+                                           "lagger": None, "lagger_zdf": 999.0})
+                for (mkt, code), r in merged.items():
+                    idx = stock_bk.get((mkt, code))
+                    if idx is None:
+                        continue
+                    g = agg[idx]
+                    g["n"] += 1
+                    if r["zdf"] is not None:
+                        if r["zdf"] > 0:
+                            g["up"] += 1
+                        elif r["zdf"] < 0:
+                            g["down"] += 1
+                        if r["ltsz"]:
+                            g["chg_w"] += r["zdf"] * r["ltsz"]
+                            g["ltsz"] += r["ltsz"]
+                        if r["zdf"] > g["leader_zdf"]:
+                            g["leader_zdf"] = r["zdf"]
+                            g["leader"] = f"{r['code']} {r['zdf']:+.2f}%"
+                        if r["zdf"] < g["lagger_zdf"]:
+                            g["lagger_zdf"] = r["zdf"]
+                            g["lagger"] = f"{r['code']} {r['zdf']:+.2f}%"
+                    if r["zljzb"] is not None:
+                        g["zljzb_sum"] += r["zljzb"]
+                        g["zljzb_n"] += 1
+                    if r["hsl"] is not None:
+                        g["hsl_sum"] += r["hsl"]
+                        g["hsl_n"] += 1
+
+                industries = []
+                for idx, g in agg.items():
+                    if idx >= len(bk_list[level]):
+                        continue
+                    name = bk_list[level][idx][0]
+                    industries.append({
+                        "name": name,
+                        "code": bk_list[level][idx][2] if len(bk_list[level][idx]) > 2 else "",
+                        "count": g["n"],
+                        "up": g["up"],
+                        "down": g["down"],
+                        "chg": round(g["chg_w"] / g["ltsz"], 2) if g["ltsz"] else None,
+                        "zljzb": round(g["zljzb_sum"] / g["zljzb_n"], 2) if g["zljzb_n"] else None,
+                        "turnover": round(g["hsl_sum"] / g["hsl_n"], 2) if g["hsl_n"] else None,
+                        "leader": g["leader"],
+                        "lagger": g["lagger"],
+                    })
+                industries.sort(key=lambda x: -(x["chg"] if x["chg"] is not None else -999))
+
+                ret = {
+                    "success": True,
+                    "level": level,
+                    "top_n": top_n,
+                    "total_industries": len(industries),
+                    "quotetime": quote.get("quotetime"),
+                    "source": "东财大盘星图",
+                }
+                ret["top"] = industries[:top_n]
+                ret["bottom"] = industries[-top_n:] if len(industries) > top_n * 2 else []
+                return ret
+
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+@cached(ttl=120)
+def fetch_industry_board(top_n: int = 20):
+    """获取东财官方行业板块排名（Playwright 爬取 gridlist#industry_board_2 页面）。
+
+    数据源: https://quote.eastmoney.com/center/gridlist.html#industry_board_2
+    页面按涨跌幅降序渲染全部行业板块（约128个），每页20行，底部 qtpager 翻页。
+    字段: 排名/板块名/最新价/涨跌额/涨跌幅/总市值/换手率/上涨家数/下跌家数/领涨股。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    try:
+        top_n = max(1, min(int(top_n), 100))
+    except (ValueError, TypeError):
+        top_n = 20
+
+    PER_PAGE = 20
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    await page.set_viewport_size({"width": 1400, "height": 900})
+                except Exception:
+                    pass
+                try:
+                    await page.goto(
+                        "https://quote.eastmoney.com/center/gridlist.html#industry_board_2",
+                        wait_until="domcontentloaded", timeout=20000,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await page.wait_for_selector(".quotetable tbody tr", timeout=15000)
+                except Exception as e:
+                    return {"success": False, "error": f"行业板块表格未渲染: {e}"}
+
+                # 表格快照: 行数|首行rank|首行名称|末行rank|末行名称
+                SNAPSHOT_JS = """() => {
+                    const trs = document.querySelectorAll('.quotetable tbody tr');
+                    if (!trs.length) return '';
+                    const c = (tds) => tds.length
+                        ? tds[0].textContent.trim() + '|' + tds[1].textContent.trim()
+                        : '';
+                    return trs.length + '|' + c(trs[0].querySelectorAll('td'))
+                                    + '|' + c(trs[trs.length - 1].querySelectorAll('td'));
+                }"""
+
+                async def _wait_page_settled(expected_rank, timeout=12.0):
+                    """等待表格渲染稳定: 首行rank匹配, 且间隔350ms两次快照完全一致。
+
+                    SPA 翻页时 rank 列先按 pageIndex 刷新、行内容后渲染,
+                    只查首行 rank 会读到"旧内容+新排名"的脏数据, 必须等快照稳定。
+                    """
+                    import time as _t
+                    deadline = _t.time() + timeout
+                    while _t.time() < deadline:
+                        sig = await page.evaluate(SNAPSHOT_JS)
+                        if sig and sig.split("|")[1] == str(expected_rank):
+                            await page.wait_for_timeout(350)
+                            sig2 = await page.evaluate(SNAPSHOT_JS)
+                            if sig2 == sig:
+                                return True
+                        else:
+                            await page.wait_for_timeout(350)
+                    return False
+
+                total_pages = await page.evaluate("""() => {
+                    const links = Array.from(document.querySelectorAll('.qtpager a'));
+                    const nums = links.map(a => parseInt(a.textContent)).filter(n => !isNaN(n));
+                    return nums.length ? Math.max(...nums) : 1;
+                }""")
+
+                items = []
+                seen_names = set()
+                MAX_READ_TRIES = 3
+
+                for pn in range(1, total_pages + 1):
+                    if pn > 1:
+                        try:
+                            await page.click(f'.qtpager a:text-is("{pn}")', timeout=3000)
+                        except Exception:
+                            try:
+                                await page.fill('.qtpager .gotoform input[type="text"]', str(pn))
+                                await page.click('.qtpager .gotoform input[type="submit"]')
+                            except Exception:
+                                pass
+
+                    rows = []
+                    ok = False
+                    for _try in range(MAX_READ_TRIES):
+                        if not await _wait_page_settled((pn - 1) * PER_PAGE + 1):
+                            if _try == MAX_READ_TRIES - 1:
+                                return {"success": False, "error": f"翻页到第{pn}页后表格未稳定"}
+                            continue
+                        rows = await page.evaluate("""() => {
+                            const num = (td) => {
+                                const t = td ? td.textContent.trim() : '';
+                                const m = t.match(/-?[0-9.]+/);
+                                return m ? parseFloat(m[0]) : null;
+                            };
+                            return Array.from(document.querySelectorAll('.quotetable tbody tr')).map(tr => {
+                                const tds = Array.from(tr.querySelectorAll('td'));
+                                const nameA = tds[1] ? tds[1].querySelector('a') : null;
+                                const name = nameA ? nameA.textContent.trim()
+                                                    : (tds[1] ? tds[1].textContent.trim() : '');
+                                const href = nameA ? (nameA.getAttribute('href') || '') : '';
+                                const m = href.match(/BK\\d+/);
+                                return {
+                                    rank: num(tds[0]),
+                                    code: m ? m[0] : '',
+                                    name: name,
+                                    price: num(tds[3]),
+                                    change: num(tds[4]),
+                                    chg: num(tds[5]),
+                                    mktcap: tds[6] ? tds[6].textContent.trim() : '',
+                                    turnover: num(tds[7]),
+                                    up: num(tds[8]),
+                                    down: num(tds[9]),
+                                    leader_name: tds[10] ? tds[10].textContent.trim() : '',
+                                    leader_chg: num(tds[11]),
+                                };
+                            });
+                        }""")
+                        names = [r.get("name", "") for r in rows]
+                        dup_names = [n for n in names if n in seen_names]
+                        if rows and not dup_names:
+                            ok = True
+                            break
+                        # 翻页竞态脏数据(旧行内容+新rank列), 等渲染完成后重读
+                        await page.wait_for_timeout(1500)
+                    if not ok:
+                        return {"success": False, "error": f"第{pn}页数据校验失败(重复板块名称)"}
+                    seen_names.update(r.get("name", "") for r in rows)
+                    items.extend(rows)
+
+                if not items:
+                    return {"success": False, "error": "行业板块表格无数据行"}
+
+                # 兜底去重: 防止极端情况下读到重渲染残留
+                seen = set()
+                dedup = []
+                for it in items:
+                    if it["rank"] in seen:
+                        continue
+                    seen.add(it["rank"])
+                    dedup.append(it)
+                items = dedup
+                items.sort(key=lambda x: x["rank"] if x["rank"] is not None else 99999)
+                return {
+                    "success": True,
+                    "total_industries": len(items),
+                    "top_n": top_n,
+                    "source": "东财行业板块页面 gridlist#industry_board_2 (Playwright)",
+                    "top": items[:top_n],
+                    "bottom": items[-top_n:] if len(items) > top_n * 2 else [],
+                }
+
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 # ── API 路由表 ──
 ROUTES = {
     "/api/fund-flow":            ("个股资金流+概念(问财)",   fetch_fund_flow_wencai, ["code"]),
@@ -2859,6 +3235,8 @@ ROUTES = {
     "/api/eps-forecast":         ("EPS一致预期(同花顺F10)",  fetch_eps_forecast, ["code"]),
     "/api/executive-changes":    ("高管持股变动(东方财富)",  fetch_executive_changes, ["code"]),
     "/api/company-events":       ("公司大事(同花顺F10)",    fetch_company_events, ["code"]),
+    "/api/industry-hotmap":      ("大盘星图行业热力(东财)",  fetch_industry_hotmap, ["level", "top_n"]),
+    "/api/industry-board":       ("行业板块排名(东财页面爬取)", fetch_industry_board, ["top_n"]),
 }
 
 

@@ -75,6 +75,18 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Custom model ID", "custom"),
         ],
     },
+    "opencodego": {
+        "quick": [
+            ("DeepSeek V4 Flash - via OpenCode Go", "deepseek-v4-flash"),
+            ("DeepSeek V4 Pro - via OpenCode Go", "deepseek-v4-pro"),
+            ("Custom model ID", "custom"),
+        ],
+        "deep": [
+            ("DeepSeek V4 Pro - via OpenCode Go", "deepseek-v4-pro"),
+            ("DeepSeek V4 Flash - via OpenCode Go", "deepseek-v4-flash"),
+            ("Custom model ID", "custom"),
+        ],
+    },
     "qwen": {
         "quick": [
             ("Qwen 3.5 Flash", "qwen3.5-flash"),

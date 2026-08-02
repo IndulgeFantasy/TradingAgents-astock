@@ -21,6 +21,7 @@ from web.history import (
 _PROVIDERS: list[tuple[str, str]] = [
     ("MiniMax（推荐·国内直连）", "minimax"),
     ("DeepSeek", "deepseek"),
+    ("OpenCode Go（DeepSeek V4 中转）", "opencodego"),
     ("Volcengine (Ark)", "volcengine"),
     ("通义千问 Qwen", "qwen"),
     ("智谱 GLM", "glm"),
@@ -143,6 +144,7 @@ def _render_llm_config() -> None:
         "LLM 供应商",
         range(len(_PROVIDERS)),
         format_func=lambda i: _PROVIDER_DISPLAY[i],
+        index=_PROVIDER_KEYS.index("opencodego"),
         key="llm_provider_idx",
         help="选择你配置了 API Key 的供应商",
     )
@@ -162,6 +164,7 @@ def _render_llm_config() -> None:
             "快速思考模型",
             range(len(quick_options)),
             format_func=lambda i: quick_labels[i],
+            index=0,
             key="quick_model_idx",
             help="用于常规分析任务，速度优先",
         )
@@ -171,6 +174,7 @@ def _render_llm_config() -> None:
             "深度思考模型",
             range(len(deep_options)),
             format_func=lambda i: deep_labels[i],
+            index=1,
             key="deep_model_idx",
             help="用于辩论/决策等需要深度推理的任务",
         )
@@ -189,7 +193,7 @@ def _render_llm_config() -> None:
         help=(
             "通过第三方中转/代理访问模型时填写网关地址；留空则用所选供应商的官方地址。"
             "API Key 仍从 .env 读取，每个供应商用各自的环境变量——"
-            "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、"
+            "OpenAI=OPENAI_API_KEY、DeepSeek=DEEPSEEK_API_KEY、OpenCode Go=OPENCODEGO_API_KEY、"
             "通义=DASHSCOPE_API_KEY、智谱=ZHIPU_API_KEY、MiniMax=MINIMAX_API_KEY、"
             "Claude=ANTHROPIC_API_KEY、OpenRouter=OPENROUTER_API_KEY、xAI=XAI_API_KEY、"
             "OpenAI 兼容（自定义）=OPENAI_COMPATIBLE_API_KEY（也接受 OPENAI_API_KEY）。"

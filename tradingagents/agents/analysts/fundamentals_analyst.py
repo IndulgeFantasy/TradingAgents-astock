@@ -56,7 +56,7 @@ def create_fundamentals_analyst(llm):
             "\n- `get_balance_sheet`：资产负债表详细数据"
             "\n- `get_cashflow`：现金流量表详细数据"
             "\n- `get_income_statement`：利润表详细数据"
-            "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，用于估值对标和行业定位）"
+            "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（东财约128个行业板块按当日涨跌幅降序排名，含最新价/涨跌额/涨跌幅/总市值/换手率/上涨下跌家数/领涨股及涨幅，用于估值对标和行业定位）"
             "\n- `get_financial_quarterly(ticker)`：获取最近4期财务数据（营收/净利润/扣非净利润同比增长率、ROE、毛利率、净利率、资产负债率、每股收益、每股经营现金流等）-- 必采用途：营收同比增长率、归母净利润同比增长率、ROE、资产负债率、经营现金流/净利润比"
             "\n- `get_stock_homepage(ticker)`：获取综合概要（PE动态/静态、PB、总市值、质押比例、大盘/小盘分类）-- 必采用途：PE(TTM)、PB、总市值、股权质押比例"
             "\n- `get_stock_industry_peers(ticker)`：获取同行业公司财务指标对标（行业排名、同行每股收益/ROE/毛利率对比）"

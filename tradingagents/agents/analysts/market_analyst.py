@@ -7,6 +7,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_kline_full,
     get_stock_levels,
     get_chip_distribution,
+    get_industry_hotmap,
     analyze_pattern,
     retry_report_generation,
 )
@@ -30,6 +31,7 @@ def create_market_analyst(llm):
             get_market_context,
             get_stock_levels,
             get_chip_distribution,
+            get_industry_hotmap,
             analyze_pattern,
         ]
 
@@ -47,6 +49,8 @@ def create_market_analyst(llm):
 - 大盘处于上升趋势时，个股的技术买入信号更可靠
 - 大盘处于下跌趋势时，个股的技术支撑位更容易被跌破
 - 大盘震荡时，优先选择与大盘走势独立（alpha）的个股
+
+📈 行业轮动：调用 get_industry_hotmap(level='bk2', top_n=20) 获取大盘星图行业热力（全市场个股按行业聚合：涨跌家数/流通市值加权涨跌幅/主力净占比/换手率/领涨领跌股），确认目标个股所属行业的板块强弱与主力资金集中度，判断个股技术信号是否与行业趋势共振。
 
 ⚠️ 标签使用规范（必读）：
 - 工具返回的标签带有方向前缀，**必须原样引用**，禁止改写为简称

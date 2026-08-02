@@ -45,6 +45,7 @@ from tradingagents.agents.utils.playwright_tools import (
     get_stock_kline_full,
     get_financial_quarterly,
     get_stock_levels,
+    get_industry_hotmap,
 )
 from tradingagents.agents.utils.analysis_tools import (
     analyze_pattern,

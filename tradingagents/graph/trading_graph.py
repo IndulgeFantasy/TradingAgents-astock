@@ -57,6 +57,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_kline_full,
     get_financial_quarterly,
     get_stock_levels,
+    get_industry_hotmap,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -321,6 +322,7 @@ class TradingAgentsGraph:
                     get_market_context,
                     get_stock_levels,
                     get_chip_distribution,
+                    get_industry_hotmap,
                     analyze_pattern,
                 ]
             ),
@@ -329,6 +331,7 @@ class TradingAgentsGraph:
                     get_news,
                     get_fund_flow,
                     get_market_context,
+                    get_industry_hotmap,
                 ]
             ),
             "news": ToolNode(
@@ -370,6 +373,7 @@ class TradingAgentsGraph:
                     get_fund_flow,
                     get_dragon_tiger_board,
                     get_industry_comparison,
+                    get_industry_hotmap,
                     get_stock_position,
                     get_stock_holder,
                     get_limit_up_pool,

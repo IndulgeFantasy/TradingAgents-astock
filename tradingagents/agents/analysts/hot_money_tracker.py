@@ -6,6 +6,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_fund_flow,
     get_hot_stocks,
     get_industry_comparison,
+    get_industry_hotmap,
     get_insider_transactions,
     get_language_instruction,
     get_limit_up_pool,
@@ -39,6 +40,7 @@ def create_hot_money_tracker(llm):
             get_fund_flow,
             get_dragon_tiger_board,
             get_industry_comparison,
+            get_industry_hotmap,
             get_stock_position,
             get_stock_holder,
             get_limit_up_pool,
@@ -70,7 +72,8 @@ def create_hot_money_tracker(llm):
             "\n- `get_fund_flow(ticker, curr_date)`：获取个股近30日主力资金净流入时间序列+所属概念板块（同花顺问财，取代原东财push2时序数据）"
             "\n- `get_dragon_tiger_board(ticker, curr_date)`：获取龙虎榜上榜记录、买卖席位明细（营业部）、机构参与情况"
             "\n- `get_stock_position(ticker)`：获取机构持股明细（哪些机构在买入/卖出、持仓占比变化），判断主力动向"
-            "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，判断板块轮动）"
+            "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（东财约128个行业板块按当日涨跌幅降序排名，含最新价/涨跌额/涨跌幅/总市值/换手率/上涨下跌家数/领涨股及涨幅，判断板块轮动）"
+            "\n- `get_industry_hotmap(level='bk2', top_n=20)`：获取大盘星图行业热力（全市场个股按行业聚合：涨跌家数/流通市值加权涨跌幅/主力净占比/换手率/领涨领跌股，判断板块轮动与主力资金集中度）"
             "\n- `get_limit_up_pool(curr_date)`：获取涨停池/连板梯队（连板数/封板资金/炸板次数/所属行业，判断市场情绪和游资接力热度）"
             "\n\n撰写详细的资金面分析报告，给出资金面总体判断（主力流入/主力流出/资金博弈/无明显信号）和短期资金面信号研判（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总量价信号、资金动向和结论。"
             "\n\n📋 必采清单 - 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
