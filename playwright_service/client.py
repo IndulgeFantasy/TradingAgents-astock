@@ -203,9 +203,15 @@ class PlaywrightClient:
         """公司大事 (同花顺F10): 重要事件+高管持股变动+股东持股变动+担保+违规"""
         return self._get("/api/company-events", {"code": code})
 
-    def industry_hotmap(self, level: str = "bk2", top_n: int = 20) -> dict:
-        """大盘星图行业热力 (东财 stockhotmap): 全市场个股按行业聚合排名"""
-        return self._get("/api/industry-hotmap", {"level": level, "top_n": top_n})
+    def industry_hotmap(self, level: str = "bk2", top_n: int = 20, ticker: str = "") -> dict:
+        """大盘星图行业热力 (东财 stockhotmap): 全市场个股按行业聚合排名。
+
+        ticker: 可选目标股票 6 位代码，返回其所属行业定位。
+        """
+        params = {"level": level, "top_n": top_n}
+        if ticker:
+            params["ticker"] = ticker
+        return self._get("/api/industry-hotmap", params)
 
     def industry_board(self, top_n: int = 20) -> dict:
         """行业板块排名 (东财 push2 JSONP): 官方板块指数涨跌幅/涨跌家数/领涨股"""

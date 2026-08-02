@@ -644,19 +644,21 @@ def get_stock_levels(
 def get_industry_hotmap(
     level: str = "bk2",
     top_n: int = 20,
+    ticker: str = "",
 ) -> str:
     """获取大盘星图行业热力（全市场个股按行业聚合排名，判断板块轮动/主力资金集中度）。数据源: 东财大盘星图。
 
     Args:
         level: 行业层级 bk1(一级31个)/bk2(二级128个)/bk3(三级337个)，默认 bk2
         top_n: 返回涨跌幅加权前 top_n 与后 top_n 个行业（默认 20）
+        ticker: 目标股票 6 位代码，可选；提供时返回该股所属行业定位（行业名/排名/涨跌幅/主力净占比/换手率）
 
     返回每个行业: 涨跌家数/流通市值加权涨跌幅(近似)/主力净占比均值/换手率均值/领涨领跌股。
     注意: 行业涨跌幅为个股流通市值加权近似值，与东财官方板块指数口径存在偏差。
     """
     try:
         client = _get_client()
-        result = client.industry_hotmap(level, top_n)
+        result = client.industry_hotmap(level, top_n, ticker)
         if not result.get("success"):
             return f"[行业热力] 获取失败: {result.get('error', '')}"
         lines = [
@@ -666,6 +668,19 @@ def get_industry_hotmap(
             "# 说明: 行业涨跌幅为个股流通市值加权近似值（非官方板块指数口径）",
             "",
         ]
+        target = result.get("target")
+        if target:
+            chg = _fmt_num(target.get("chg"), '+.2f', "N/A") + "%" if target.get("chg") is not None else "N/A"
+            zljzb = _fmt_num(target.get("zljzb"), '+.2f', "N/A") + "%" if target.get("zljzb") is not None else "N/A"
+            turn = _fmt_num(target.get("turnover"), '.2f', "N/A") + "%" if target.get("turnover") is not None else "N/A"
+            lines.append(
+                f"## ★ 目标股 {target.get('code', ticker)} 所属行业: {target.get('industry','')}"
+                f" (BK{target.get('industry_code','')}) | 排名 {target.get('rank','?')}/{target.get('total','?')}"
+            )
+            lines.append(
+                f"    加权涨跌幅 {chg} | 主力净占比 {zljzb} | 换手率 {turn} | 涨/跌家数 {target.get('up','?')}/{target.get('down','?')}"
+            )
+            lines.append("")
         top = result.get("top", [])
         bottom = result.get("bottom", [])
         if top:

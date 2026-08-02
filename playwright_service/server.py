@@ -840,7 +840,8 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                 # 若请求天数更多，则通过浏览器上下文 (page.request, Chrome 网络栈+身份)
                 # 用相同 URL 重新请求 lmt=days、fqt=0(不复权，筹码分布标准) 的完整历史。
                 # push2his 会封 python-requests 指纹，直接 requests.get 会被断连。
-                if len(klines) < days and captured_url:
+                # 仅当 URL 属于目标个股时才重取——兜底分支可能拿到指数对比图的 URL。
+                if len(klines) < days and captured_url and expected_secid in captured_url:
                     try:
                         import re as _re, json as _json, urllib.parse as _up
                         _u = _up.urlsplit(captured_url)
@@ -849,7 +850,7 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                         _qs["fqt"] = ["0"]
                         _long_url = _up.urlunsplit(
                             (_u.scheme, _u.netloc, _u.path, _up.urlencode(_qs, doseq=True), ""))
-                        _resp = await page.request.get(_long_url, timeout=25000)
+                        _resp = await page.request.get(_long_url, timeout=30000)
                         if _resp.ok:
                             _d = _json.loads(_re.sub(r'^\w+\(|\)[^)]*$', '', await _resp.text()))
                             _k2 = _d.get("data", {}).get("klines", []) or []
@@ -906,6 +907,10 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                     result["limit_prices"] = limit_prices
                 if resp_code and resp_code != code:
                     result["warning"] = f"响应代码({resp_code})与请求代码({code})不匹配，可能数据源返回了指数"
+                if len(records) < days:
+                    _prev = result.get("warning", "")
+                    _msg = f"仅获取{len(records)}根K线(<请求{days}根)，历史窗口不足（次新股或重取失败）"
+                    result["warning"] = f"{_prev}; {_msg}" if _prev else _msg
                 return result
 
             finally:
@@ -2871,11 +2876,12 @@ def fetch_company_events(code: str):
 # getmcode/getquotebasedata/getquotedata 三个 API（绕过 push2 风控），其中约 5%
 # 个股行经过 AES 加密，需在页面内用 CryptoJS 解密（密钥 = Datas 头 + mcode 尾段）。
 @cached(ttl=120)
-def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20):
+def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = ""):
     """获取大盘星图行业热力数据（全市场个股按三级行业聚合）。
 
     level: bk1(一级行业) / bk2(二级行业) / bk3(三级行业)
     top_n: 返回涨跌幅加权前 top_n 与后 top_n 个行业（默认 20）
+    ticker: 可选目标股票 6 位代码，返回其所属行业定位（行业名/排名/聚合数据）
 
     Returns per-industry: 行业名/代码、个股数、上涨/下跌家数、
     流通市值加权涨跌幅(近似)、主力净占比均值、换手率均值、领涨/领跌股。
@@ -3019,6 +3025,45 @@ def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20):
                     })
                 industries.sort(key=lambda x: -(x["chg"] if x["chg"] is not None else -999))
 
+                # 目标股票行业定位（方案A: 用 stock_bk 映射查询目标股所属行业）
+                target_info = None
+                if ticker:
+                    tcode = str(ticker).strip()
+                    if tcode.isdigit() and len(tcode) == 6:
+                        market = "1" if tcode.startswith(("6", "9")) else "0"
+                        tidx = stock_bk.get((market, tcode))
+                        if tidx is None:
+                            # 沪/深市场判断兜底: 遍历两个市场
+                            for m in ("0", "1"):
+                                if (m, tcode) in stock_bk:
+                                    tidx = stock_bk[(m, tcode)]
+                                    break
+                        if tidx is not None and tidx < len(bk_list[level]):
+                            tname = bk_list[level][tidx][0]
+                            ind = next(
+                                (i for i in industries if i["name"] == tname), None
+                            )
+                            rank = (
+                                industries.index(ind) + 1 if ind is not None else None
+                            )
+                            target_info = {
+                                "code": tcode,
+                                "industry": tname,
+                                "industry_code": (
+                                    bk_list[level][tidx][2]
+                                    if len(bk_list[level][tidx]) > 2
+                                    else ""
+                                ),
+                                "rank": rank,
+                                "total": len(industries),
+                                "count": ind["count"] if ind else None,
+                                "up": ind["up"] if ind else None,
+                                "down": ind["down"] if ind else None,
+                                "chg": ind["chg"] if ind else None,
+                                "zljzb": ind["zljzb"] if ind else None,
+                                "turnover": ind["turnover"] if ind else None,
+                            }
+
                 ret = {
                     "success": True,
                     "level": level,
@@ -3029,6 +3074,8 @@ def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20):
                 }
                 ret["top"] = industries[:top_n]
                 ret["bottom"] = industries[-top_n:] if len(industries) > top_n * 2 else []
+                if target_info:
+                    ret["target"] = target_info
                 return ret
 
             finally:

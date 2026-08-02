@@ -2516,8 +2516,10 @@ def get_astock_chip_distribution(
         # 数据源: playwright_service 浏览器通道（规避东财 push2his 直连风控；
         # 服务端会通过浏览器上下文重取 lmt=350、fqt=0 不复权完整历史）。
         # records 含 date/open/close/high/low/volume/turnover，与 _compute_cyq 所需字段一致。
-        from tradingagents.agents.utils.playwright_tools import _get_client
-        res = _get_client().stock_kline_full(code, _CYQ_KLINE_COUNT)
+        # 350根需要 页面加载(≤15s)+浏览器重取(≤30s)，共享单例客户端默认30s超时会间歇性
+        # TimeoutError，这里用独立长超时客户端。
+        from playwright_service.client import PlaywrightClient
+        res = PlaywrightClient(timeout=90).stock_kline_full(code, _CYQ_KLINE_COUNT)
         if not res.get("success"):
             return f"[筹码分布] {code}: {res.get('error', '')}"
         klines = res.get("data", []) or []
@@ -2542,7 +2544,7 @@ def get_astock_chip_distribution(
             health = "警惕（获利盘极高，抛压风险大）"
         elif c90 < 0.15 and 0.3 <= profit_ratio < 0.9:
             health = "健康（筹码集中且获利比例适中）"
-        elif c90 >= 0.25:
+        elif c90 >= 0.30:
             health = "警惕（筹码分散，主力控盘弱）"
         else:
             health = "一般"
@@ -2551,7 +2553,7 @@ def get_astock_chip_distribution(
         lines.append(f"获利比例: {profit_ratio:.1%}")
         lines.append(f"平均成本: {avg_cost}")
         lines.append(f"90%成本区间: {cyq['cost_90_low']} ~ {cyq['cost_90_high']}")
-        lines.append(f"90%集中度: {c90:.2%} {'(集中)' if c90 < 0.15 else '(分散)' if c90 > 0.25 else '(适中)'}")
+        lines.append(f"90%集中度: {c90:.2%} {'(集中)' if c90 < 0.15 else '(分散)' if c90 > 0.30 else '(适中)'}")
         lines.append(f"70%成本区间: {cyq['cost_70_low']} ~ {cyq['cost_70_high']}")
         lines.append(f"70%集中度: {c70:.2%}")
         lines.append(f"筹码健康度: {health}")
