@@ -43,7 +43,7 @@
 
 | 维度 | 原版 | 本 Fork |
 |------|------|---------|
-| **数据源** | Yahoo Finance / Alpha Vantage | mootdx + 东财 + 新浪 + 同花顺（全免费直连） |
+| **数据源** | Yahoo Finance / Alpha Vantage | mootdx + 腾讯 + 东财 + 新浪 + 同花顺 + 财联社 + 百度（全免费直连） |
 | **Analyst 角色** | 4 个（市场/情绪/新闻/基本面） | **7 个**（+政策分析师/游资追踪/解禁监控） |
 | **交易规则** | 美股（T+0、无涨跌停） | A 股（T+1、涨跌停、最小手数、交易时段） |
 | **输出语言** | 英文 | 中文报告（内部辩论保持英文以保证推理质量） |
@@ -71,6 +71,9 @@
 │  Market → Social → News → Fundamentals                   │
 │  → Policy → Hot Money → Lockup                           │
 │         （每个 Analyst 带工具循环）                          │
+├─────────────────────────────────────────────────────────┤
+│              Quality Gate 质量门禁                         │
+│      （Layer 1 硬检查 A-F 评级 + Layer 2 LLM 复审）          │
 ├─────────────────────────────────────────────────────────┤
 │               Bull vs Bear 投研辩论                       │
 │         Bull Researcher ←→ Bear Researcher               │
@@ -102,18 +105,18 @@
 
 | 角色 | 职责 | 数据工具 |
 |------|------|---------|
-| 🏪 市场分析师 | K 线形态、技术指标、量价分析 | `get_stock_data`, `get_indicators` |
-| 💬 舆情分析师 | 社交媒体情绪、散户讨论热度 | `get_news` |
-| 📰 新闻分析师 | 行业新闻、公告、宏观事件 | `get_news`, `get_global_news`, `get_insider_transactions` |
-| 📊 基本面分析师 | 财报三表、盈利能力、估值 | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement` |
+| 🏪 市场分析师 | K 线形态、技术指标、量价分析、行业热力 | `get_stock_kline_full`, `get_indicators`, `get_market_context`, `get_stock_levels`, `get_chip_distribution`, `get_industry_hotmap`, `analyze_pattern` |
+| 💬 舆情分析师 | 社交媒体情绪、散户讨论热度、主力资金情绪 | `get_news`, `get_fund_flow`, `get_market_context`, `get_industry_hotmap` |
+| 📰 新闻分析师 | 行业新闻、公告、宏观事件 | `get_news`, `get_global_news` |
+| 📊 基本面分析师 | 财报三表、盈利能力、估值 | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement`, `get_profit_forecast`, `get_industry_comparison`, `get_financial_quarterly`, `get_stock_homepage`, `get_stock_industry_peers`, `get_insider_transactions`, `get_stock_holder`, `verify_stock_valuation` |
 
 ### A 股特化 3 角色（新增）
 
 | 角色 | 职责 | 数据工具 | 为什么需要 |
 |------|------|---------|-----------|
 | 🏛️ 政策分析师 | 监管政策、产业政策、窗口指导 | `get_news`, `get_global_news` | A 股是政策市，政策变化直接影响板块轮动 |
-| 🔥 游资追踪师 | 龙虎榜、大单流向、主力资金动态 | `get_stock_data`, `get_news`, `get_insider_transactions` | 游资是 A 股短线定价的核心力量 |
-| 🔓 解禁监控师 | 限售股解禁、大股东减持、股权质押 | `get_insider_transactions`, `get_news`, `get_fundamentals` | 解禁是 A 股特有的重大供给冲击因素 |
+| 🔥 游资追踪师 | 龙虎榜、大单流向、主力资金动态、涨停梯队 | `get_stock_kline_full`, `get_news`, `get_insider_transactions`, `get_hot_stocks`, `get_northbound_flow`, `get_concept_blocks`, `get_fund_flow`, `get_dragon_tiger_board`, `get_industry_comparison`, `get_industry_hotmap`, `get_stock_position`, `get_stock_holder`, `get_limit_up_pool` | 游资是 A 股短线定价的核心力量 |
+| 🔓 解禁监控师 | 限售股解禁、大股东减持、股权质押 | `get_insider_transactions`, `get_news`, `get_lockup_expiry`, `get_stock_basic`, `get_stock_holder`, `get_stock_equity_history` | 解禁是 A 股特有的重大供给冲击因素 |
 
 所有 7 个 Analyst 的报告会流入后续的 Bull/Bear 辩论和三方风险辩论，确保 A 股特色因素贯穿整条决策链。
 
@@ -127,11 +130,12 @@
 |------|------|---------|
 | **mootdx** | TCP 7709 | OHLCV K 线、财务快照、F10 文本 |
 | **腾讯财经** | HTTP (`qt.gtimg.cn`) | PE / PB / 市值 / 换手率（实时） |
-| **东方财富** | HTTP (datacenter / push2) | 龙虎榜、限售解禁、板块行情、个股信息 |
-| **新浪财经** | HTTP | K 线历史、财报三表 |
-| **同花顺** | HTTP (10jqka) | EPS 一致预期 |
+| **东方财富** | HTTP (datacenter-web / push2 / push2his / push2ex / np-weblist / search-api-web) | 龙虎榜、限售解禁、行业对比、资金流、筹码分布、涨停池、实时行情、滚动新闻、个股新闻 |
+| **新浪财经** | HTTP | K 线历史（fallback）、财报三表、个股新闻（fallback） |
+| **同花顺** | HTTP (10jqka / data.hexin.cn) | EPS 一致预期、热股题材、北向资金（hsgtApi） |
+| **同花顺 F10 / 问财** | playwright_service（Chrome CDP） | 股本结构、股东研究、财务季报、主力持仓、行业对标、概念归属、支撑压力位、资金流 |
 | **财联社** | HTTP (cls.cn) | 全球财经快讯 |
-| **百度股市通** | HTTP (finance.pae.baidu) | 概念板块分类、资金流向 |
+| **百度股市通** | HTTP (gushitong.baidu) | 概念板块归属（资金流已迁移至东财 push2） |
 
 > 完全不依赖 Tushare（积分墙）、Alpha Vantage（海外 API）、Yahoo Finance（不支持 A 股）。
 
@@ -139,7 +143,7 @@
 
 > **数据源优先级 & 东财防封（v0.2.19 加 threading.Lock 线程安全）**：行情 / K线 / 市值 / 财务能从 mootdx（通达信 TCP，不封 IP）或腾讯拿到的，一律走它们；东财只用于它独有的数据（龙虎榜 / 解禁 / 资金流 / 板块 / 个股新闻 / 筹码分布 / 涨停池等）。所有东财请求统一走内置节流入口 `_em_get()`：`threading.Lock` 保护串行限流（默认间隔 ≥1s + 0.1~0.5s 随机抖动）+ 复用 Keep-Alive 会话，Web UI 多 analyst 并发安全。批量场景可设环境变量 `EM_MIN_INTERVAL=1.5~2` 降速。
 
-> **playwright_service 数据服务（必选）**：同花顺F10/问财等纯前端渲染页面需要独立 HTTP 服务（`playwright_service/`，跑在 worktrade2 conda 环境）。主程序通过 `PlaywrightClient` HTTP 调用，不直接依赖 playwright 库。内置熔断器保护（5次连续失败后熔断60秒）。未启动时自动降级到 a_stock 直连 HTTP 数据源。
+> **playwright_service 数据服务（必选）**：同花顺F10/问财等纯前端渲染页面需要独立 HTTP 服务（`playwright_service/`，跑在 worktrade2 conda 环境）。主程序通过 `PlaywrightClient` HTTP 调用，不直接依赖 playwright 库。内置熔断器保护（5次连续失败后熔断60秒）。`get_fund_flow` / `get_profit_forecast` / `get_concept_blocks` 三个双实现工具默认走 playwright 版本（`tool_vendors` 默认配置）；服务未启动时它们返回可读错误提示，可把对应 `tool_vendors` 改回 `"a_stock"` 切到直连 HTTP 实现。
 
 ## 快速开始
 
@@ -198,6 +202,12 @@ ANTHROPIC_AUTH_TOKEN=your-kimi-token
 # ── 方案 H：任意 OpenAI 兼容网关（9Router / AI Router / 自建代理）──
 OPENAI_COMPATIBLE_API_KEY=sk-xxx     # 也接受 OPENAI_API_KEY
 BACKEND_URL=https://your-relay.example/v1   # 你的网关地址（也可在 Web 侧栏「API Base URL」填）
+
+# ── 方案 I：OpenCode Go（DeepSeek V4 中转）────────────
+OPENCODEGO_API_KEY=sk-xxx
+
+# ── 方案 J：火山方舟 Volcengine（Ark）─────────────────
+VOLCENGINE_API_KEY=xxx-xxx
 ```
 
 ### 3. 运行分析
@@ -264,7 +274,7 @@ streamlit run web/app.py
 
 ### 功能
 
-- **模型自选**：侧边栏支持 10 个 LLM 供应商切换（MiniMax/DeepSeek/Qwen/GLM/OpenAI/Anthropic/Google/xAI/OpenRouter/Ollama），外加 **「OpenAI 兼容（自定义 base_url）」** 一档可接任意 OpenAI 兼容网关（9Router / AI Router / 自建代理）
+- **模型自选**：侧边栏支持 12 个 LLM 供应商切换（MiniMax/DeepSeek/OpenCode Go/Volcengine 火山方舟/通义千问 Qwen/智谱 GLM/OpenAI/Anthropic/Google Gemini/xAI Grok/OpenRouter/Ollama），外加 **「OpenAI 兼容（自定义 base_url）」** 一档，共 13 个选项，可接任意 OpenAI 兼容网关（9Router / AI Router / 自建代理）
 - **一键分析**：输入 6 位 A 股代码 + 分析日期 +「数据起始日期」（默认本月第一天，可自定义技术分析回溯区间，支持按月/自定义时段分析），点击「开始分析」
 - **实时进度**：12 阶段 pipeline 实时显示（7 分析师 → 质量门控 → 辩论 → 风控 → 决策），所有已完成阶段的报告均可展开查看
 - **完整报告**：信号卡片（Buy/Hold/Sell）、7 份分析师报告、多空辩论、风控评估
@@ -285,15 +295,19 @@ streamlit run web/app.py
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `llm_provider` | `"minimax"` | LLM 提供商：`minimax` / `deepseek` / `qwen` / `glm` / `openai` / `anthropic` / `google` / `xai` / `ollama` |
-| `deep_think_llm` | `"MiniMax-M2.7"` | Research Manager + Portfolio Manager 用的模型 |
-| `quick_think_llm` | `"MiniMax-M2.7-highspeed"` | 所有 Analyst / Researcher / Trader 用的模型 |
+| `llm_provider` | `"openai"` | LLM 提供商：`minimax` / `deepseek` / `opencodego` / `volcengine` / `qwen` / `glm` / `openai` / `anthropic` / `google` / `xai` / `openrouter` / `ollama` / `openai_compatible` |
+| `deep_think_llm` | `"gpt-5.4"` | Research Manager + Portfolio Manager 用的模型 |
+| `quick_think_llm` | `"gpt-5.4-mini"` | 所有 Analyst / Researcher / Trader 用的模型 |
 | `backend_url` | `None` | 自定义 API 端点 / 第三方中转网关。可在 Web UI 侧边栏填写，或用 `.env` 的 `BACKEND_URL`；方便国内通过代理访问 Claude / OpenAI |
 | `output_language` | `"Chinese"` | 报告输出语言（内部辩论始终英文） |
 | `market_lookback_days` | `None` | 技术分析回溯天数（分析区间 = 起始日期 → 分析日期）。Web/CLI 由「数据起始日期」自动算出；`None` = 模型自选（约 30 天）。#16 |
 | `max_debate_rounds` | `1` | Bull vs Bear 辩论轮数 |
 | `max_risk_discuss_rounds` | `1` | 风险三方辩论轮数 |
-| `data_vendors` | 全部 `"a_stock"` | 数据供应商路由 |
+| `data_vendors` | 全部 `"a_stock"` | 数据供应商路由（类别级） |
+| `tool_vendors` | `get_fund_flow` / `get_profit_forecast` / `get_concept_blocks` = `"playwright"` | 工具级路由，优先于类别级 |
+| `deep_think_provider_override` | `None` | 设为 `"claude_agent_sdk"` 时深度节点走个人 Claude 订阅额度 |
+| `quick_think_provider_override` | `None` | 再加这条 = 全节点走个人 Claude 订阅额度 |
+| `agent_sdk_model` / `agent_sdk_quick_model` | `"opus"` / `"sonnet"` | Agent SDK 使用的 Claude 模型别名 |
 | `checkpoint_enabled` | `False` | 启用 SQLite 断点续跑 |
 | `memory_log_max_entries` | `None` | 交易记忆最大条目数 |
 
@@ -302,7 +316,7 @@ streamlit run web/app.py
 ## 常见问题排错
 
 **Q: 用 DeepSeek/通义/智谱，却报 `OpenAIError: The api_key client option must be set ... OPENAI_API_KEY`？**
-每个供应商用**各自的环境变量**，不是 OPENAI_API_KEY：DeepSeek=`DEEPSEEK_API_KEY`、通义=`DASHSCOPE_API_KEY`、智谱=`ZHIPU_API_KEY`、MiniMax=`MINIMAX_API_KEY`、xAI=`XAI_API_KEY`、OpenRouter=`OPENROUTER_API_KEY`、OpenAI 兼容（自定义）=`OPENAI_COMPATIBLE_API_KEY`。在项目根目录 `.env` 里设置对应变量后**重启**程序。（v0.2.12 起缺 key 会直接提示该用哪个变量名。）
+每个供应商用**各自的环境变量**，不是 OPENAI_API_KEY：DeepSeek=`DEEPSEEK_API_KEY`、通义=`DASHSCOPE_API_KEY`、智谱=`ZHIPU_API_KEY`、MiniMax=`MINIMAX_API_KEY`、xAI=`XAI_API_KEY`、OpenRouter=`OPENROUTER_API_KEY`、OpenCode Go=`OPENCODEGO_API_KEY`、火山方舟=`VOLCENGINE_API_KEY`、OpenAI 兼容（自定义）=`OPENAI_COMPATIBLE_API_KEY`。在项目根目录 `.env` 里设置对应变量后**重启**程序。（v0.2.12 起缺 key 会直接提示该用哪个变量名。）
 
 **Q: 想接一个 OpenAI 兼容的第三方网关/中继（9Router、AI Router、自建代理），自定义 base_url + model？**
 用 **「OpenAI 兼容（自定义 base_url）」** 这一档（v0.2.20 新增）。Web 侧栏「LLM 供应商」选它 →「快速/深度思考模型 ID」手动填你网关支持的 model 名 →「API Base URL」填你的网关地址（如 `https://your-relay.example/v1`）→ `.env` 里设 `OPENAI_COMPATIBLE_API_KEY=你的key`（也接受 `OPENAI_API_KEY`）。CLI 方式选 `OpenAI-Compatible` 后会提示输入 Base URL。它走标准 Chat Completions（非 OpenAI Responses API，兼容性最好），model 名自由填、不受内置清单限制。配置方式等价：`llm_provider="openai_compatible"` + `backend_url="<你的网关>"` + `deep_think_llm/quick_think_llm="<你的model>"`。
@@ -352,7 +366,7 @@ TradingAgents-Astock/
 ├── tradingagents/
 │   ├── agents/
 │   │   ├── analysts/          # 7 个分析师
-│   │   │   ├── market_analyst.py        # 技术分析（K线/指标/筹码/形态）
+│   │   │   ├── market_analyst.py        # 技术分析（K线/指标/筹码/形态/行业热力）
 │   │   │   ├── social_media_analyst.py  # 情绪分析
 │   │   │   ├── news_analyst.py          # 新闻分析
 │   │   │   ├── fundamentals_analyst.py  # 基本面（含精确估值验算）
@@ -368,29 +382,31 @@ TradingAgents-Astock/
 │   │       ├── agent_utils.py           # 工具聚合导入
 │   │       ├── analysis_tools.py        # K线形态识别 @tool（12种形态）
 │   │       ├── financial_rigor.py       # 精确十进制计算 @tool（PE/PB/ROE验算）
-│   │       ├── playwright_tools.py      # playwright_service 工具入口
+│   │       ├── playwright_tools.py      # playwright_service 工具入口（11 独立 + 3 vendor 路由）
 │   │       ├── signal_data_tools.py     # 信号数据 @tool（含筹码/涨停池）
 │   │       └── ...
 │   ├── dataflows/
 │   │   ├── a_stock.py         # A 股数据 vendor（直连 HTTP，含CYQ筹码算法）
 │   │   ├── interface.py       # VENDOR_METHODS 路由表（19个方法）
 │   │   └── ...
+│   ├── llm_clients/           # 13 个供应商的 LLM 客户端（含 claude_agent_sdk）
 │   └── graph/
 │       ├── trading_graph.py   # 主入口：TradingAgentsGraph + ToolNode 注册
-│       ├── setup.py           # LangGraph 拓扑定义
+│       ├── setup.py           # LangGraph 拓扑定义（含 Quality Gate 节点）
 │       ├── propagation.py     # 状态初始化与传播
-│       ├── quality_gate.py    # 质量门禁节点
-│       ├── reflection.py      # 交易反思（东财push2his收益，非yfinance）
+│       ├── reflection.py      # 交易反思（收益走 playwright_service 东财K线，非yfinance）
 │       └── conditional_logic.py
 ├── playwright_service/         # 独立 HTTP 数据服务（worktrade2 环境）
-│   ├── server.py              # 16端点 API + Chrome CDP 抓取
+│   ├── server.py              # 18 端点 API + Chrome CDP 抓取
 │   ├── client.py              # HTTP 客户端 + 熔断器（threading.Lock 线程安全）
 │   └── README.md
+├── cli/                       # 交互式 CLI 入口
 ├── web/
 │   ├── app.py                 # Streamlit 主入口
-│   ├── runner.py              # 后台线程运行分析
+│   ├── runner.py              # 后台线程运行分析（支持暂停/恢复/停止）
 │   └── ...
-├── tests/                     # 180 项单元测试
+├── examples/run_cases.py      # 批量跑多标的 + 完整报告落盘
+├── tests/                     # 254 项单元测试（v0.4.0 实测 214 passed / 1 skipped / 45 subtests）
 ├── CHANGES_FROM_UPSTREAM.md   # 与上游的完整改动记录
 ├── NOTICE                     # Apache 2.0 归属声明
 ├── LICENSE                    # Apache 2.0 许可证
