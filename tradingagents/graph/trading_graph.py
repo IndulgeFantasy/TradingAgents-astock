@@ -58,6 +58,9 @@ from tradingagents.agents.utils.agent_utils import (
     get_financial_quarterly,
     get_stock_levels,
     get_industry_hotmap,
+    get_web_search,
+    get_article_content,
+    get_stock_news,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -271,7 +274,9 @@ class TradingAgentsGraph:
             self.conditional_logic,
         )
 
-        self.propagator = Propagator()
+        self.propagator = Propagator(
+            max_recur_limit=self.config.get("max_recur_limit", 100)
+        )
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
 
@@ -338,6 +343,9 @@ class TradingAgentsGraph:
                 [
                     get_news,
                     get_global_news,
+                    get_web_search,
+                    get_article_content,
+                    get_stock_news,
                 ]
             ),
             "fundamentals": ToolNode(

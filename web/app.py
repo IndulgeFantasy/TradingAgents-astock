@@ -18,6 +18,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 # 注意：load_dotenv 仅在进程启动时执行一次，启动后修改 .env 仍需重启 Web 服务才生效。
 load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
+# File logging: streamlit runs app.py as the main script, so configure here
+# (web/launch.py spawns streamlit via subprocess and cannot carry handlers over).
+from tradingagents.utils.logging_setup import setup_file_logging  # noqa: E402
+
+setup_file_logging(_PROJECT_ROOT / "logs", "tradingagents_web")
+
 from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 
 from web.components.progress_panel import render_progress  # noqa: E402

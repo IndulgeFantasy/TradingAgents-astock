@@ -62,7 +62,7 @@ def _price_df(prices):
 
 
 def _kline_data(prices, start_date="2026-01-05"):
-    """Build synthetic K-line dicts matching _em_fetch_klines output.
+    """Build synthetic K-line dicts matching the service kline endpoint output.
 
     Each dict has: date, open, close, high, low, volume, amount, amplitude, pct_chg, turnover.
     Dates are consecutive trading days starting from start_date.

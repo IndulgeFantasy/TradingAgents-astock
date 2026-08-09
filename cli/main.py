@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 load_dotenv(".env.enterprise", override=False)
+
+# File logging: all library loggers propagate to the root handler here.
+from tradingagents.utils.logging_setup import setup_file_logging  # noqa: E402
+
+setup_file_logging(Path(__file__).resolve().parent.parent / "logs", "tradingagents_cli")
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.live import Live

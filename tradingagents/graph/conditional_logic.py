@@ -6,10 +6,12 @@ from tradingagents.agents.utils.agent_states import AgentState
 class ConditionalLogic:
     """Handles conditional logic for determining graph flow."""
 
-    def __init__(self, max_debate_rounds=1, max_risk_discuss_rounds=1):
+    def __init__(self, max_debate_rounds=1, max_risk_discuss_rounds=1, max_news_tool_rounds=12):
         """Initialize with configuration parameters."""
         self.max_debate_rounds = max_debate_rounds
         self.max_risk_discuss_rounds = max_risk_discuss_rounds
+        # news 专用工具(搜索/正文)单次分析硬上限, 防多轮循环烧光 recursion 预算
+        self.max_news_tool_rounds = max_news_tool_rounds
 
     def should_continue_market(self, state: AgentState):
         """Determine if market analysis should continue."""
@@ -28,12 +30,24 @@ class ConditionalLogic:
         return "Msg Clear Social"
 
     def should_continue_news(self, state: AgentState):
-        """Determine if news analysis should continue."""
+        """Determine if news analysis should continue.
+
+        Hard cap on search/article tool rounds is enforced INSIDE the
+        news_analyst node (超限时改用无工具 LLM 调用强制生成最终报告),
+        so reaching the cap never skips the final report. Here we only
+        route on whether the last message still carries tool calls.
+        """
         messages = state["messages"]
         last_message = messages[-1]
-        if last_message.tool_calls:
-            return "tools_news"
-        return "Msg Clear News"
+        if hasattr(last_message, "tool_calls"):
+            last_tools = last_message.tool_calls
+        elif isinstance(last_message, dict):
+            last_tools = last_message.get("tool_calls") or []
+        else:
+            last_tools = []
+        if not last_tools:
+            return "Msg Clear News"
+        return "tools_news"
 
     def should_continue_fundamentals(self, state: AgentState):
         """Determine if fundamentals analysis should continue."""

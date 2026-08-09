@@ -164,8 +164,8 @@ def get_chip_distribution(
 ) -> str:
     """
     Retrieve chip distribution (筹码分布) for an A-stock.
-    Computes profit ratio, average cost, 90%/70% concentration zones
-    using a CYQ algorithm on ~350 daily K-lines (不复权, 换手衰减系数0.5).
+    通达信口径: ~350 根前复权日K + 自归一三角分布(峰值(H+L)/2) + 衰减系数1.0，
+    经 fengwo(通达信DLL) 与东财官方数据交叉验证（平均误差 <1.5pt）。
     Shows chip health assessment (healthy/warning based on concentration and profit ratio).
     Args:
         ticker (str): A-stock code

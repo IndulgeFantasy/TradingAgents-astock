@@ -171,9 +171,16 @@ class PlaywrightClient:
         """主要大盘指数概览（快速参考）"""
         return self._get("/api/market-overview")
 
-    def stock_kline_full(self, code: str, days: int = 120) -> dict:
-        """个股增强K线: 含换手率/涨跌幅/振幅"""
-        return self._get("/api/stock-kline-full", {"code": code, "days": days})
+    def stock_kline_full(self, code: str, days: int = 120, fqt: int = None) -> dict:
+        """个股增强K线: 含换手率/涨跌幅/振幅。
+
+        fqt: 0=不复权, 1=前复权。None=默认（页面数据即前复权；超窗口重取不复权）。
+        筹码分布(CYQ)官方口径为前复权，调用时传 fqt=1。
+        """
+        params = {"code": code, "days": days}
+        if fqt is not None:
+            params["fqt"] = fqt
+        return self._get("/api/stock-kline-full", params)
 
     def financial_quarterly(self, code: str) -> dict:
         """季频财务指标(同花顺F10): 净利润同比/ROE/毛利率/负债率/EPS"""
@@ -216,3 +223,45 @@ class PlaywrightClient:
     def industry_board(self, top_n: int = 20) -> dict:
         """行业板块排名 (东财 push2 JSONP): 官方板块指数涨跌幅/涨跌家数/领涨股"""
         return self._get("/api/industry-board", {"top_n": top_n})
+
+    def search_bing(self, q: str, count: int = 20, freshness: str = "") -> dict:
+        """Bing 搜索 (国内直连): 网页搜索结果，返回标题/URL/摘要/来源域名
+
+        freshness: "" | "day" | "week" | "month" — Bing 时间过滤
+        """
+        from urllib.parse import quote
+
+        params = {"q": quote(q), "count": count}
+        if freshness:
+            params["freshness"] = freshness
+        return self._get("/api/search-bing", params)
+
+    def search_quark(self, q: str, count: int = 10) -> dict:
+        """夸克 AI 搜索 (国内直连): AI 结构化总结 + 资讯列表 (标题/URL/摘要/来源/日期)
+
+        夸克 AI 回答异步生成, 单次耗时可达 60s+, 显式放宽超时(默认 30s 会导致
+        urlopen 超时计入熔断计数, 连续多次触发熔断中断全服务)。
+        """
+        from urllib.parse import quote
+
+        return self._get(
+            "/api/search-quark",
+            {"q": quote(q), "count": count},
+            timeout=90,
+        )
+
+    def fetch_article(self, url: str, max_chars: int = 3000) -> dict:
+        """文章正文抓取: 标题/发布时间/正文 (站点专用选择器 + 通用启发式)"""
+        return self._get("/api/fetch-article", {"url": url, "max_chars": max_chars})
+
+    def global_news_cls(self, limit: int = 20) -> dict:
+        """全球快讯(财联社电报): 标题/摘要/时间/重要度(level A/B/C)"""
+        return self._get("/api/global-news-cls", {"limit": limit})
+
+    def global_news_em(self, limit: int = 20) -> dict:
+        """全球快讯(东财7x24): 标题/摘要/时间"""
+        return self._get("/api/global-news-em", {"limit": limit})
+
+    def stock_news_em(self, limit: int = 20) -> dict:
+        """股市聚焦新闻(东财股票频道): 按区块(股市聚焦/大盘分析/板块聚焦等)返回标题/URL/时间"""
+        return self._get("/api/stock-news-em", {"limit": limit})

@@ -24,6 +24,9 @@ import sys
 import argparse
 import traceback
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from functools import wraps
@@ -48,6 +51,50 @@ except Exception:
 HOST = os.getenv("AKD_HOST", "127.0.0.1")
 PORT = int(os.getenv("AKD_PORT", "8765"))
 CACHE_TTL = int(os.getenv("AKD_CACHE_TTL", "300"))
+
+logger = logging.getLogger("playwright_service")
+
+# Windows GBK console cannot encode ⚠/emoji in startup prints (crashes when
+# stdout is redirected). Force UTF-8 output so the service never dies on print.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
+
+def _setup_file_logging() -> str:
+    """Attach a rotating file handler to the playwright_service logger.
+
+    Standalone service (own conda env), so it cannot import the main
+    project's logging_setup; keep a small local copy here.
+    """
+    level = getattr(logging, os.getenv("AKD_LOG_LEVEL", "INFO").strip().upper(),
+                    logging.INFO)
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "server.log"
+    if not any(
+        isinstance(h, RotatingFileHandler)
+        and Path(getattr(h, "baseFilename", "")).resolve() == log_path.resolve()
+        for h in logger.handlers
+    ):
+        handler = RotatingFileHandler(
+            log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    return str(log_path)
+
+# 指数白名单：000xxx 同时是沪市指数与深市主板股票代码
+# （如 000963 华东医药、000001 平安银行），必须以白名单区分指数；
+# 其余 000/002/300/301 开头一律按深市个股处理。
+_INDEX_CODES = {"000001", "000010", "000016", "000300", "000688", "000852",
+                "000905", "000906", "399001", "399006", "399106", "399303"}
 
 _cache = {}
 
@@ -186,6 +233,31 @@ def cached(ttl=None):
     return decorator
 
 
+async def _wait_for_ready(page, check, timeout=12.0, poll_ms=250, confirm_rounds=2):
+    """信号驱动等待：轮询 `check`（async callable，返回真值=数据就绪）直到满足或超时。
+
+    替代固定 wait_for_timeout：页面数据就绪即返回（通常 0.5~2s），
+    慢时最多等到 timeout（与原固定等待同量级，不改变提取兜底逻辑）。
+    confirm_rounds: 连续 N 次轮询都为真才认为就绪（SPA 渐进渲染防抖）。
+    返回 True=就绪，False=超时（调用方走原有兜底）。
+    """
+    deadline = time.time() + timeout
+    hits = 0
+    while time.time() < deadline:
+        try:
+            ok = await check()
+        except Exception:
+            ok = False
+        if ok:
+            hits += 1
+            if hits >= confirm_rounds:
+                return True
+        else:
+            hits = 0
+        await page.wait_for_timeout(poll_ms)
+    return hits >= confirm_rounds
+
+
 # ── fetch_stock_basic: 股本结构（同花顺 equity.html）──
 @cached(ttl=3600)
 def fetch_stock_basic(code: str):
@@ -207,7 +279,14 @@ def fetch_stock_basic(code: str):
                     f"https://basic.10jqka.com.cn/{code}/equity.html",
                     wait_until="domcontentloaded", timeout=20000
                 )
-                await page.wait_for_timeout(6000)
+                # 信号等待: 等"总股本"数据渲染完成（固定 6s -> 通常 0.5~2s）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(document.body && document.body.innerText.includes('总股本'))"
+                    ),
+                    timeout=12.0,
+                )
 
                 # 提取股本表格 + 多期历史
                 equity = await page.evaluate("""() => {
@@ -324,7 +403,7 @@ def fetch_stock_basic(code: str):
 
 
 # ── fetch_market_overview: 大盘概览（东财 zs 页面）──
-@cached(ttl=60)
+@cached(ttl=600)
 def fetch_market_overview():
     import asyncio
     try:
@@ -473,7 +552,13 @@ def fetch_market_overview():
                             timeout=15000
                         ) as resp_info:
                             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                        await page.wait_for_timeout(2000)
+                        # 信号等待: 已捕获到K线后留约 0.5s 让多套K线响应到齐
+                        await _wait_for_ready(
+                            page,
+                            lambda: bool(captured["kline_list"]),
+                            timeout=8.0,
+                            poll_ms=200,
+                        )
 
                         # 东财指数页面可能返回多套 K 线（长期日K + 短期日K），
                         # 取最后捕获的那个（通常是页面主图的日K，长度 60-120）
@@ -729,12 +814,16 @@ def fetch_market_overview():
 
 
 # ── 13. 个股增强K线（东财 push2his，含换手率/涨跌幅/成交量）──
-@cached(ttl=60)
-def fetch_stock_kline_full(code: str, days: int = 120):
+@cached(ttl=600)
+def fetch_stock_kline_full(code: str, days: int = 120, fqt: int = 0):
     """
     通过 playwright 访问东财个股/指数页面，获取含换手率的增强K线。
     K线格式: date, open, close, high, low, volume, amount, amplitude%, pctChg%, turnover%
     支持指数代码（000/399 开头，如 000300 沪深300），指数页为 zs 前缀。
+
+    fqt: 重取历史K线时的复权方式（0=不复权, 1=前复权）。
+        页面默认加载前复权(fqt=1)数据；天数超出页面窗口时需要按 fqt 重取。
+        筹码分布(CYQ)官方口径为前复权，应传 fqt=1。
     """
     try:
         days = max(1, min(int(days), 10000))
@@ -754,11 +843,12 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                 page = await ctx.new_page()
                 await page.set_viewport_size({"width": 1280, "height": 800})
 
-                # 指数识别：000/399 开头为指数。
+                # 指数识别：000xxx 同时是沪市指数与深市主板股票（如 000963 华东医药、
+                # 000001 平安银行），必须用白名单区分。
                 # 沪市指数(000xxx): 上证/沪深300/科创50/中证500 → secid 1.xxx、zs 页面
                 # 深市指数(399xxx): 深成/创业板/国证2000    → secid 0.xxx、zs 页面
                 # 股票: 6/9 开头为沪市(secid 1.xxx、sh 页面)，其余为深市(secid 0.xxx、sz 页面)
-                is_index = code.startswith(("000", "399"))
+                is_index = code in _INDEX_CODES
                 if is_index:
                     prefix = "zs"
                     market_id = "1" if code.startswith("000") else "0"
@@ -772,7 +862,6 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                 # comparison chart.  Collect all push2his kline responses and
                 # select the one matching the requested stock's secid, so index
                 # data never overwrites stock data (issue: 收盘价与创业板指高度吻合).
-                market_id = "1" if code.startswith(("6", "9")) else "0"
                 expected_secid = f"secid={market_id}.{code}"
 
                 captured_list = []
@@ -807,7 +896,13 @@ def fetch_stock_kline_full(code: str, days: int = 120):
 
                 page.on("response", on_resp)
                 await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(5000)
+                # 信号等待: 拦截到 push2his K线响应即就绪（顺带修复响应慢时误报"未获取到K线数据"）
+                await _wait_for_ready(
+                    page,
+                    lambda: bool(captured_list),
+                    timeout=12.0,
+                    poll_ms=250,
+                )
 
                 if not captured_list:
                     return {"success": False, "error": "未获取到K线数据"}
@@ -838,8 +933,8 @@ def fetch_stock_kline_full(code: str, days: int = 120):
 
                 # 页面默认只加载约120根日K（半屏窗口），且 chart 请求的是前复权(fqt=1)数据。
                 # 若请求天数更多，则通过浏览器上下文 (page.request, Chrome 网络栈+身份)
-                # 用相同 URL 重新请求 lmt=days、fqt=0(不复权，筹码分布标准) 的完整历史。
-                # push2his 会封 python-requests 指纹，直接 requests.get 会被断连。
+                # 用相同 URL 重新请求 lmt=days、fqt=fqt(默认0不复权，筹码分布用1前复权)
+                # 的完整历史。push2his 会封 python-requests 指纹，直接 requests.get 会被断连。
                 # 仅当 URL 属于目标个股时才重取——兜底分支可能拿到指数对比图的 URL。
                 if len(klines) < days and captured_url and expected_secid in captured_url:
                     try:
@@ -847,7 +942,7 @@ def fetch_stock_kline_full(code: str, days: int = 120):
                         _u = _up.urlsplit(captured_url)
                         _qs = _up.parse_qs(_u.query)
                         _qs["lmt"] = [str(days)]
-                        _qs["fqt"] = ["0"]
+                        _qs["fqt"] = [str(fqt)]
                         _long_url = _up.urlunsplit(
                             (_u.scheme, _u.netloc, _u.path, _up.urlencode(_qs, doseq=True), ""))
                         _resp = await page.request.get(_long_url, timeout=30000)
@@ -952,7 +1047,14 @@ def fetch_stock_homepage(code: str):
                     f"https://basic.10jqka.com.cn/{code}/",
                     wait_until="domcontentloaded", timeout=15000
                 )
-                await page.wait_for_timeout(6000)
+                # 信号等待: 估值数据渲染完成
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(document.body && (document.body.innerText.includes('市盈率') || document.body.innerText.includes('总市值')))"
+                    ),
+                    timeout=12.0,
+                )
 
                 text = await page.evaluate("() => document.body.innerText")
                 import re as re_h
@@ -1109,7 +1211,14 @@ def fetch_stock_equity_history(code: str):
                 await page.set_viewport_size({"width": 1280, "height": 800})
                 await page.goto(f"https://basic.10jqka.com.cn/{code}/equity.html",
                                 wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(6000)
+                # 信号等待: 股本结构表渲染完成（至少 2 张表且有数据行）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => { const ts = document.querySelectorAll('table'); return ts.length >= 2 && !!ts[1].querySelectorAll('tr').length; }"
+                    ),
+                    timeout=12.0,
+                )
 
                 result = await page.evaluate("""() => {
                     const ts = document.querySelectorAll('table');
@@ -1189,7 +1298,14 @@ def fetch_stock_holder(code: str):
                     f"https://basic.10jqka.com.cn/{code}/holder.html",
                     wait_until="domcontentloaded", timeout=15000
                 )
-                await page.wait_for_timeout(6000)
+                # 信号等待: 股东数据渲染完成（出现股东人数表）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(document.body && (document.body.innerText.includes('股东人数') || document.querySelectorAll('table').length >= 3))"
+                    ),
+                    timeout=12.0,
+                )
 
                 result = await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
@@ -1415,7 +1531,14 @@ def fetch_stock_position(code: str):
                        f"#/position?code={code}&marketid={marketid}&code_name=")
 
                 await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(8000)
+                # 信号等待: 机构持股汇总表出现且行数>=6（提取逻辑要求）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => { const t = document.querySelectorAll('table')[0]; return !!t && t.querySelectorAll('tr').length >= 6; }"
+                    ),
+                    timeout=12.0,
+                )
 
                 result = await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
@@ -1509,7 +1632,12 @@ def fetch_financial_quarterly(code: str):
                     f"https://basic.10jqka.com.cn/{code}/finance.html",
                     wait_until="domcontentloaded", timeout=20000
                 )
-                await page.wait_for_timeout(8000)
+                # 信号等待: 财务指标矩阵表渲染完成（提取逻辑要求 tables>=5）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate("() => document.querySelectorAll('table').length >= 5"),
+                    timeout=14.0,
+                )
 
                 # === 1. 财务指标矩阵 + 2. 指标变动说明 + 3. 审计意见 + 4. 资产负债构成 ===
                 raw = await page.evaluate("""() => {
@@ -1787,7 +1915,14 @@ def fetch_stock_industry_peers(code: str):
                     f"https://basic.10jqka.com.cn/{code}/field.html",
                     wait_until="domcontentloaded", timeout=15000
                 )
-                await page.wait_for_timeout(6000)
+                # 信号等待: 行业分类/同行对比渲染完成
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(document.body && (document.body.innerText.includes('行业分类') || document.body.innerText.includes('同行业')))"
+                    ),
+                    timeout=12.0,
+                )
 
                 text = await page.evaluate("() => document.body.innerText")
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -1888,6 +2023,7 @@ def fetch_stock_industry_peers(code: str):
 # ── 15. 个股概念归属（通过问财查询）──
 
 
+@cached(ttl=3600)
 def fetch_concept_blocks_wencai(code: str):
     """通过问财查询个股所属概念板块（适配 v2 API，不再依赖 mcp_query_table）。"""
     import asyncio
@@ -1956,7 +2092,7 @@ def fetch_concept_blocks_wencai(code: str):
 
 
 # ── 16. 个股资金流时序+概念（通过 playwright 拉问财 barline3）──
-@cached(ttl=120)
+@cached(ttl=600)
 def fetch_fund_flow_wencai(code: str):
     """
     通过 playwright 查询问财，提取:
@@ -2052,6 +2188,7 @@ def fetch_fund_flow_wencai(code: str):
 
 
 # ── 17. 个股支撑位/压力位（通过 playwright 拉问财 kline2）──
+@cached(ttl=600)
 def fetch_stock_levels(code: str):
     """通过 playwright 查询问财 kline2 组件，获取支撑位/压力位"""
     import asyncio
@@ -2108,7 +2245,7 @@ def fetch_stock_levels(code: str):
 
 
 # ── 18. 问财通用查询（整合所有可用组件）──
-@cached(ttl=120)
+@cached(ttl=600)
 def fetch_wencai_all(code: str):
     """一次问财查询，返回所有可用数据组件
 
@@ -2184,6 +2321,7 @@ def fetch_wencai_all(code: str):
 
 
 # ── 19. EPS一致预期（通过 playwright 拉同花顺F10）──
+@cached(ttl=3600)
 def fetch_eps_forecast(code: str):
     """通过 playwright 访问同花顺F10 worth页面，提取完整数据。
 
@@ -2206,7 +2344,14 @@ def fetch_eps_forecast(code: str):
                         f"https://basic.10jqka.com.cn/{code}/worth.html",
                         wait_until="domcontentloaded", timeout=20000
                     )
-                    await page.wait_for_timeout(5000)
+                    # 信号等待: 机构预测数据渲染完成
+                    await _wait_for_ready(
+                        page,
+                        lambda: page.evaluate(
+                            "() => !!(document.body && document.body.innerText.includes('预测') && document.querySelectorAll('table').length >= 1)"
+                        ),
+                        timeout=12.0,
+                    )
 
                     # 单次 evaluate 提取所有结构化数据：
                     # - tables: 所有 <table> 的二维数组
@@ -2598,7 +2743,22 @@ def fetch_executive_changes(code: str):
                     f"https://data.eastmoney.com/gdggcg/ggdetail/{code}.html",
                     wait_until="domcontentloaded", timeout=20000
                 )
-                await page.wait_for_timeout(5000)
+                # 信号等待: 高管变动表数据行数稳定后再提取（渐进渲染防半成品；
+                # 行数极少的股票也会快速稳定，避免无谓等待）
+                _EXEC_ROWS_JS = (
+                    "() => { for (const t of document.querySelectorAll('table')) {"
+                    " const h = (t.rows[0]?.textContent || '') + (t.rows[1]?.textContent || '');"
+                    " if (h.includes('变动人')) return t.querySelectorAll('tr').length; } return 0; }"
+                )
+
+                async def _exec_rows_settled():
+                    n = await page.evaluate(_EXEC_ROWS_JS)
+                    if n < 2:
+                        return False
+                    await page.wait_for_timeout(400)
+                    return (await page.evaluate(_EXEC_ROWS_JS)) == n
+
+                await _wait_for_ready(page, _exec_rows_settled, timeout=12.0, confirm_rounds=1)
 
                 result = await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
@@ -2693,7 +2853,14 @@ def fetch_company_events(code: str):
                     f"https://basic.10jqka.com.cn/{code}/event.html",
                     wait_until="domcontentloaded", timeout=20000
                 )
-                await page.wait_for_timeout(5000)
+                # 信号等待: 事件表格+章节标题渲染完成（section 分类依赖 h2）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => document.querySelectorAll('table').length >= 2 && document.querySelectorAll('h2').length >= 1"
+                    ),
+                    timeout=12.0,
+                )
 
                 result = await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
@@ -2875,29 +3042,61 @@ def fetch_company_events(code: str):
 # 全市场个股 → 三级行业归属聚合。数据源: quote.eastmoney.com/stockhotmap 页面的
 # getmcode/getquotebasedata/getquotedata 三个 API（绕过 push2 风控），其中约 5%
 # 个股行经过 AES 加密，需在页面内用 CryptoJS 解密（密钥 = Datas 头 + mcode 尾段）。
-@cached(ttl=120)
-def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = ""):
-    """获取大盘星图行业热力数据（全市场个股按三级行业聚合）。
+# 注意: 全量聚合数据(重)与 ticker 定位(轻)解耦——数据本体按 (level, top_n) 缓存,
+# ticker 不参与缓存键, 避免不同 analyst 传不同 ticker 导致重复爬取同一份大盘星图。
 
-    level: bk1(一级行业) / bk2(二级行业) / bk3(三级行业)
-    top_n: 返回涨跌幅加权前 top_n 与后 top_n 个行业（默认 20）
-    ticker: 可选目标股票 6 位代码，返回其所属行业定位（行业名/排名/聚合数据）
+def _hotmap_locate_ticker(
+    ticker: str,
+    stock_bk: dict,
+    bk_list: dict,
+    industries: list,
+    level: str,
+) -> dict | None:
+    """在已聚合的 industries 上定位目标股票所属行业(纯计算, 不爬取)。"""
+    tcode = str(ticker).strip()
+    if not (tcode.isdigit() and len(tcode) == 6):
+        return None
+    market = "1" if tcode.startswith(("6", "9")) else "0"
+    tidx = stock_bk.get((market, tcode))
+    if tidx is None:
+        for m in ("0", "1"):
+            if (m, tcode) in stock_bk:
+                tidx = stock_bk[(m, tcode)]
+                break
+    if tidx is None or tidx >= len(bk_list[level]):
+        return None
+    tname = bk_list[level][tidx][0]
+    ind = next((i for i in industries if i["name"] == tname), None)
+    rank = industries.index(ind) + 1 if ind is not None else None
+    return {
+        "code": tcode,
+        "industry": tname,
+        "industry_code": (
+            bk_list[level][tidx][2] if len(bk_list[level][tidx]) > 2 else ""
+        ),
+        "rank": rank,
+        "total": len(industries),
+        "count": ind["count"] if ind else None,
+        "up": ind["up"] if ind else None,
+        "down": ind["down"] if ind else None,
+        "chg": ind["chg"] if ind else None,
+        "zljzb": ind["zljzb"] if ind else None,
+        "turnover": ind["turnover"] if ind else None,
+    }
 
-    Returns per-industry: 行业名/代码、个股数、上涨/下跌家数、
-    流通市值加权涨跌幅(近似)、主力净占比均值、换手率均值、领涨/领跌股。
+
+@cached(ttl=600)
+def _fetch_industry_hotmap_core(level: str = "bk2", top_n: int = 20):
+    """大盘星图行业热力全量聚合数据(按 level/top_n 缓存, 不含 ticker)。
+
+    与 fetch_industry_hotmap 解耦: ticker 定位是纯计算, 不参与缓存键,
+    同一份全量数据可服务任意目标股票, 避免跨 analyst 重复爬取。
     """
     import asyncio
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         return {"success": False, "error": "playwright 未安装"}
-
-    if level not in ("bk1", "bk2", "bk3"):
-        level = "bk2"
-    try:
-        top_n = max(1, min(int(top_n), 100))
-    except (ValueError, TypeError):
-        top_n = 20
 
     async def _do_query():
         async with async_playwright() as p:
@@ -2910,7 +3109,15 @@ def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = "")
                     "https://quote.eastmoney.com/stockhotmap/",
                     wait_until="domcontentloaded", timeout=20000,
                 )
-                await page.wait_for_timeout(4000)
+                # 信号等待: SPA 加载完成（内部 fetch 解密依赖 CryptoJS 库）
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(window.CryptoJS && document.body && document.body.innerText.length)"
+                    ),
+                    timeout=8.0,
+                    poll_ms=200,
+                )
 
                 payload = await page.evaluate("""async () => {
                     const mcodeResp = await fetch('api/getmcode', {method:'POST'});
@@ -3025,45 +3232,6 @@ def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = "")
                     })
                 industries.sort(key=lambda x: -(x["chg"] if x["chg"] is not None else -999))
 
-                # 目标股票行业定位（方案A: 用 stock_bk 映射查询目标股所属行业）
-                target_info = None
-                if ticker:
-                    tcode = str(ticker).strip()
-                    if tcode.isdigit() and len(tcode) == 6:
-                        market = "1" if tcode.startswith(("6", "9")) else "0"
-                        tidx = stock_bk.get((market, tcode))
-                        if tidx is None:
-                            # 沪/深市场判断兜底: 遍历两个市场
-                            for m in ("0", "1"):
-                                if (m, tcode) in stock_bk:
-                                    tidx = stock_bk[(m, tcode)]
-                                    break
-                        if tidx is not None and tidx < len(bk_list[level]):
-                            tname = bk_list[level][tidx][0]
-                            ind = next(
-                                (i for i in industries if i["name"] == tname), None
-                            )
-                            rank = (
-                                industries.index(ind) + 1 if ind is not None else None
-                            )
-                            target_info = {
-                                "code": tcode,
-                                "industry": tname,
-                                "industry_code": (
-                                    bk_list[level][tidx][2]
-                                    if len(bk_list[level][tidx]) > 2
-                                    else ""
-                                ),
-                                "rank": rank,
-                                "total": len(industries),
-                                "count": ind["count"] if ind else None,
-                                "up": ind["up"] if ind else None,
-                                "down": ind["down"] if ind else None,
-                                "chg": ind["chg"] if ind else None,
-                                "zljzb": ind["zljzb"] if ind else None,
-                                "turnover": ind["turnover"] if ind else None,
-                            }
-
                 ret = {
                     "success": True,
                     "level": level,
@@ -3074,8 +3242,10 @@ def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = "")
                 }
                 ret["top"] = industries[:top_n]
                 ret["bottom"] = industries[-top_n:] if len(industries) > top_n * 2 else []
-                if target_info:
-                    ret["target"] = target_info
+                # 供外层 ticker 定位复用（不参与返回给调用方）
+                ret["_industries"] = industries
+                ret["_stock_bk"] = stock_bk
+                ret["_bk_list"] = bk_list
                 return ret
 
             finally:
@@ -3090,7 +3260,43 @@ def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = "")
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
-@cached(ttl=120)
+def fetch_industry_hotmap(level: str = "bk2", top_n: int = 20, ticker: str = ""):
+    """获取大盘星图行业热力数据（全市场个股按三级行业聚合）。
+
+    level: bk1(一级行业) / bk2(二级行业) / bk3(三级行业)
+    top_n: 返回涨跌幅加权前 top_n 与后 top_n 个行业（默认 20）
+    ticker: 可选目标股票 6 位代码，返回其所属行业定位（行业名/排名/聚合数据）。
+            仅参与结果组装, 不参与缓存键, 同一份全量数据可服务不同 ticker。
+
+    Returns per-industry: 行业名/代码、个股数、上涨/下跌家数、
+    流通市值加权涨跌幅(近似)、主力净占比均值、换手率均值、领涨/领跌股。
+    """
+    if level not in ("bk1", "bk2", "bk3"):
+        level = "bk2"
+    try:
+        top_n = max(1, min(int(top_n), 100))
+    except (ValueError, TypeError):
+        top_n = 20
+
+    ret = _fetch_industry_hotmap_core(level, top_n)
+    if not ret.get("success"):
+        return ret
+
+    # 目标股票行业定位: 纯计算复用 core 的全量数据, 不触发重新爬取。
+    # 注意: 缓存对象不可修改(多调用方共享), 先浅拷贝再组装 target。
+    import copy
+    ret = copy.copy(ret)
+    industries = ret.pop("_industries", None)
+    stock_bk = ret.pop("_stock_bk", None)
+    bk_list = ret.pop("_bk_list", None)
+    if ticker and industries is not None and stock_bk is not None and bk_list is not None:
+        target_info = _hotmap_locate_ticker(ticker, stock_bk, bk_list, industries, level)
+        if target_info:
+            ret["target"] = target_info
+    return ret
+
+
+@cached(ttl=600)
 def fetch_industry_board(top_n: int = 20):
     """获取东财官方行业板块排名（Playwright 爬取 gridlist#industry_board_2 页面）。
 
@@ -3266,7 +3472,780 @@ def fetch_industry_board(top_n: int = 20):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+@cached(ttl=180)
+def fetch_global_news_cls(limit: int = 20):
+    """财联社电报全球快讯（Playwright 爬取）。
+
+    数据源: https://www.cls.cn/telegraph
+    财联社电报页会请求带 sign 签名的 api/cache 接口（直接 HTTP 已 404），
+    通过拦截页面响应获取 roll_data。
+    字段: title/brief/content/ctime(unix秒)/level(A/B/C重要度)。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (ValueError, TypeError):
+        limit = 20
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    try:
+                        await page.set_viewport_size({"width": 1400, "height": 900})
+                    except Exception:
+                        pass
+                    captured = []
+
+                    async def _on_resp(resp):
+                        if "api/cache" in resp.url and "telegraph" in resp.url:
+                            try:
+                                body = await resp.text()
+                                data = json.loads(body)
+                                roll = (data.get("data") or {}).get("roll_data") or []
+                                if roll:
+                                    captured.append(roll)
+                            except Exception:
+                                pass
+
+                    page.on("response", lambda r: asyncio.create_task(_on_resp(r)))
+                    try:
+                        await page.goto(
+                            "https://www.cls.cn/telegraph",
+                            wait_until="domcontentloaded", timeout=20000,
+                        )
+                    except Exception:
+                        pass
+                    # 等待拦截到数据（最长 15s）
+                    deadline = time.time() + 15
+                    while not captured and time.time() < deadline:
+                        await page.wait_for_timeout(500)
+
+                    if not captured:
+                        return {"success": False, "error": "未捕获到财联社电报数据 (api/cache 未返回)"}
+
+                    roll = captured[0]
+                    items = []
+                    for it in roll:
+                        title = (it.get("title") or "").strip() or (it.get("brief") or "").strip()
+                        if not title:
+                            continue
+                        ctime = it.get("ctime", "")
+                        pub_time = ""
+                        if ctime:
+                            try:
+                                pub_time = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
+                            except (ValueError, TypeError, OSError):
+                                pub_time = str(ctime)
+                        items.append({
+                            "title": title,
+                            "content": (it.get("content") or "").strip() or (it.get("brief") or "").strip(),
+                            "time": pub_time,
+                            "ctime": ctime,
+                            "level": it.get("level", ""),
+                            "source": "CLS Wire",
+                        })
+                    if not items:
+                        return {"success": False, "error": "财联社电报无数据条目"}
+                    return {
+                        "success": True,
+                        "data": items[:limit],
+                        "total": len(roll),
+                        "limit": limit,
+                        "source": "财联社电报 cls.cn/telegraph (Playwright)",
+                    }
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+@cached(ttl=180)
+def fetch_global_news_em(limit: int = 20):
+    """东方财富 7x24 全球快讯（Playwright 爬取）。
+
+    数据源: https://kuaixun.eastmoney.com/
+    页面请求 np-weblist.eastmoney.com/comm/web/getFastNewsList（JSONP 格式），
+    通过拦截页面响应剥壳解析 fastNewsList。
+    字段: title/summary/showTime。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (ValueError, TypeError):
+        limit = 20
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    try:
+                        await page.set_viewport_size({"width": 1400, "height": 900})
+                    except Exception:
+                        pass
+                    captured = []
+
+                    async def _on_resp(resp):
+                        if "getFastNewsList" in resp.url:
+                            try:
+                                body = await resp.text()
+                                # JSONP 剥壳: jQueryxxx({...})
+                                if body.startswith("jQuery"):
+                                    body = body[body.index("(") + 1: body.rindex(")")]
+                                data = json.loads(body)
+                                items = (data.get("data") or {}).get("fastNewsList") or []
+                                if items:
+                                    captured.append(items)
+                            except Exception:
+                                pass
+
+                    page.on("response", lambda r: asyncio.create_task(_on_resp(r)))
+                    try:
+                        await page.goto(
+                            "https://kuaixun.eastmoney.com/",
+                            wait_until="domcontentloaded", timeout=20000,
+                        )
+                    except Exception:
+                        pass
+                    # 等待拦截到数据（最长 15s）
+                    deadline = time.time() + 15
+                    while not captured and time.time() < deadline:
+                        await page.wait_for_timeout(500)
+
+                    if not captured:
+                        return {"success": False, "error": "未捕获到东财7x24快讯数据 (getFastNewsList 未返回)"}
+
+                    items = []
+                    for it in captured[0]:
+                        title = (it.get("title") or "").strip()
+                        if not title:
+                            continue
+                        items.append({
+                            "title": title,
+                            "content": (it.get("summary") or "").strip(),
+                            "time": it.get("showTime", ""),
+                            "source": "Eastmoney Global",
+                        })
+                    if not items:
+                        return {"success": False, "error": "东财7x24快讯无数据条目"}
+                    return {
+                        "success": True,
+                        "data": items[:limit],
+                        "total": len(captured[0]),
+                        "limit": limit,
+                        "source": "东财7x24 kuaixun.eastmoney.com (Playwright)",
+                    }
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+@cached(ttl=180)
+def fetch_stock_news_em(limit: int = 20):
+    """东财股票频道新闻汇总（Playwright 爬取 DOM）。
+
+    数据源: https://stock.eastmoney.com/
+    按区块提取重点栏目新闻（股市聚焦[焦点/题材/个股/市场/主力]/大盘分析/板块聚焦/
+    行业研究/热门股追踪/主力动态/股市直播/港股聚焦/亚太市场/美股聚焦/欧洲市场等），
+    每条: 标题(a.title 完整标题)/URL/发布时间(如有)/所属区块。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    try:
+        limit = max(1, min(int(limit), 120))
+    except (ValueError, TypeError):
+        limit = 20
+
+    EXTRACT_JS = """() => {
+        const out = [];
+        const seen = new Set();
+        document.querySelectorAll('div.card_title, div.card_header').forEach(titleEl => {
+            const sec = (titleEl.textContent || '').replace(/更多\\s*$/, '').trim();
+            if (!sec) return;
+            let node = titleEl.parentElement;
+            if (!node) return;
+            if (!/card/i.test(node.className)) {
+                for (let d = 0; d < 3; d++) {
+                    if (!node.parentElement) break;
+                    node = node.parentElement;
+                    if (/card/i.test(node.className)) break;
+                }
+            }
+            if (!/card/i.test(node.className)) return;
+            node.querySelectorAll('a[href*="finance.eastmoney.com/a/"]').forEach(a => {
+                const href = (a.href || '').split('#')[0];
+                if (!href || seen.has(href)) return;
+                const title = (a.title || a.textContent || '').trim().replace(/\\s+/g, ' ');
+                if (title.length < 6) return;
+                seen.add(href);
+                let sub = '';
+                const li = a.closest('li');
+                if (li && /list-title/.test(li.className)) {
+                    const tag = li.querySelector('span, strong');
+                    if (tag) sub = (tag.textContent || '').trim();
+                }
+                let time = '';
+                const parent = a.parentElement;
+                if (parent) {
+                    const sp = parent.querySelector('span.pull-right');
+                    if (sp) time = sp.textContent.trim();
+                }
+                out.push({title: title, url: href, time: time, section: sub ? sec + '-' + sub : sec});
+            });
+        });
+        // 行业研报表 (日期/板块名/相关链接/涨跌幅/行业研报标题)
+        document.querySelectorAll('table').forEach(t => {
+            const head = (t.innerText || '').slice(0, 60);
+            if (!(head.includes('涨跌幅') && head.includes('行业研报'))) return;
+            t.querySelectorAll('tbody tr').forEach(tr => {
+                const tds = tr.querySelectorAll('td');
+                if (tds.length < 5) return;
+                const date = (tds[0].textContent || '').trim();
+                const nameA = tds[1].querySelector('a');
+                const name = nameA ? nameA.textContent.trim() : (tds[1].textContent || '').trim();
+                const chg = (tds[3].textContent || '').trim();
+                const reportA = tds[4].querySelector('a');
+                const rtitle = reportA ? (reportA.textContent || '').trim() : (tds[4].textContent || '').trim();
+                const rurl = reportA ? reportA.href : '';
+                if (!name || !rtitle) return;
+                const key = date + name + rtitle;
+                if (seen.has(key)) return;
+                seen.add(key);
+                out.push({
+                    title: [date, name, chg, rtitle].filter(Boolean).join(' ') + ' ',
+                    url: rurl,
+                    time: date,
+                    section: '行业研报表'
+                });
+            });
+        });
+        return out;
+    }"""
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    try:
+                        await page.set_viewport_size({"width": 1400, "height": 900})
+                    except Exception:
+                        pass
+                    try:
+                        await page.goto(
+                            "https://stock.eastmoney.com/",
+                            wait_until="domcontentloaded", timeout=20000,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector("div.card_title", timeout=15000)
+                    except Exception as e:
+                        return {"success": False, "error": f"东财股票频道区块未渲染: {e}"}
+                    items = await page.evaluate(EXTRACT_JS)
+                    if not items:
+                        return {"success": False, "error": "东财股票频道无新闻条目"}
+                    return {
+                        "success": True,
+                        "data": items[:limit],
+                        "total": len(items),
+                        "limit": limit,
+                        "source": "东财股票频道 stock.eastmoney.com (Playwright)",
+                    }
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 # ── API 路由表 ──
+# ── 18. Bing 搜索 (国内直连) ──
+
+_BING_FRESHNESS_FILTER = {
+    "day": 'ex1:"ez5_1704"',
+    "week": 'ex1:"ez5_1703"',
+    "month": 'ex1:"ez5_1702"',
+}
+
+@cached(ttl=180)
+def fetch_search_bing(q: str, count: int = 20, freshness: str = ""):
+    """Bing 网页搜索（www.bing.com 国内直连, 自动落到 cn.bing.com）。
+
+    返回每条: 标题/URL/摘要/来源域名/发布时间(如有)。
+    freshness: "" | "day" | "week" | "month" → Bing filters 时间过滤。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    try:
+        count = max(1, min(int(count), 20))
+    except (ValueError, TypeError):
+        count = 20
+
+    filters = _BING_FRESHNESS_FILTER.get(str(freshness).strip().lower(), "")
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    await page.set_viewport_size({"width": 1280, "height": 900})
+                    from urllib.parse import quote
+
+                    async def _extract():
+                        results = await page.evaluate("""() => {
+                            const out = [];
+                            document.querySelectorAll('li.b_algo').forEach(li => {
+                                const a = li.querySelector('h2 a');
+                                if (!a) return;
+                                const cap = li.querySelector('.b_caption p, .b_caption');
+                                const cite = li.querySelector('cite');
+                                const t = li.querySelector('time');
+                                const snippet = cap ? cap.textContent.trim() : '';
+                                let dom = '';
+                                if (cite) {
+                                    dom = cite.textContent.trim()
+                                        .replace(/^https?:\\/\\//, '').replace(/^www\\./, '');
+                                } else {
+                                    try {
+                                        const u = new URL(a.href);
+                                        dom = u.hostname.replace(/^www\\./, '');
+                                    } catch (e) {}
+                                }
+                                out.push({
+                                    title: a.textContent.trim(),
+                                    url: a.href,
+                                    snippet: snippet.slice(0, 400),
+                                    source_domain: dom,
+                                    publish_time: t ? t.textContent.trim() : '',
+                                });
+                            });
+                            return out;
+                        }""")
+                        return results
+
+                    # Bing cn 每页最多 10 条, count>10 时翻页 (first=11) 取第二页
+                    pages_to_fetch = 2 if count > 10 else 1
+                    all_results = []
+                    for pn in range(pages_to_fetch):
+                        if pn == 0:
+                            url = (
+                                "https://www.bing.com/search?q=" + quote(q)
+                                + f"&setlang=zh-hans&cc=cn&count=10"
+                            )
+                        else:
+                            url = (
+                                "https://www.bing.com/search?q=" + quote(q)
+                                + f"&setlang=zh-hans&cc=cn&first={pn * 10 + 1}"
+                            )
+                        if filters:
+                            url += "&filters=" + quote(filters)
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        except Exception:
+                            pass
+                        try:
+                            await page.wait_for_selector("li.b_algo", timeout=12000)
+                        except Exception:
+                            pass
+                        # 信号等待: 结果条数稳定后再提取（懒加载渐进渲染）
+                        async def _bing_results_settled():
+                            n = await page.evaluate("() => document.querySelectorAll('li.b_algo').length")
+                            if n == 0:
+                                return False
+                            await page.wait_for_timeout(400)
+                            return (await page.evaluate("() => document.querySelectorAll('li.b_algo').length")) == n
+                        await _wait_for_ready(page, _bing_results_settled, timeout=6.0, confirm_rounds=1)
+                        page_results = await _extract()
+                        seen = {r["url"] for r in all_results}
+                        for r in page_results:
+                            if r["url"] not in seen:
+                                all_results.append(r)
+                    all_results = all_results[:count]
+                    if not all_results:
+                        return {"success": False, "error": "Bing 无搜索结果或页面结构变化"}
+                    return {
+                        "success": True, "query": q,
+                        "count": len(all_results), "results": all_results,
+                        "source": "Bing (cn)",
+                    }
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+# ── 19. 夸克 AI 搜索 (ai.quark.cn, 结构化 AI 总结 + 资讯列表) ──
+# 纯 URL 直访: https://ai.quark.cn/s/x?from=kkframenew_resultsearch&by=submit&q={查询词}
+# pageid 随意(页面自动重定向生成), 关键参数是 q。AI 回答异步生成约 5-10s。
+# 结果页: .results 为 AI 总结区(直接给答案), .result-EzdYH 为资讯卡片。
+
+_QUARK_ITEM_SEL = '[class*="result-EzdYH"], [class*="result-"]'
+# AI 总结容器: .sgs-container (流式生成, 可能很短或不存在——不是每个查询都触发 AI 总结)
+# 资讯列表: .results (预渲染, t≈1s 即出现, 稳定)
+_QUARK_SUMMARY_SEL = '.sgs-container'
+_QUARK_RESULTS_SEL = '.results'
+
+@cached(ttl=600)
+def fetch_search_quark(q: str, count: int = 10):
+    """夸克 AI 网页搜索（ai.quark.cn 国内直连）。
+
+    返回: AI 结构化总结(ai_summary) + 资讯条目列表(标题/URL/摘要/来源/日期)。
+    """
+    import asyncio
+    import re
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    try:
+        count = max(1, min(int(count), 20))
+    except (ValueError, TypeError):
+        count = 10
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    await page.set_viewport_size({"width": 1280, "height": 900})
+                    from urllib.parse import quote
+                    url = (
+                        "https://ai.quark.cn/s/x?from=kkframenew_resultsearch"
+                        f"&by=submit&q={quote(q)}"
+                    )
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                    # AI 回答异步生成: 轮询等待 .sgs-container (AI 总结) 出现并稳定。
+                    # 注意: 不是每个查询都触发 AI 总结——资讯列表(.results)预渲染稳定,
+                    # AI 总结(.sgs-container)流式生成, 且生成前容器内是"以上内容由AI生成"
+                    # 的模板占位文本(~41字符)。因此:
+                    #   - 长度 <=100 或含模板关键词 → 视为"未开始生成", 不计入稳定判定
+                    #   - 真实内容(>100字符) 连续两次采样长度相同 → 生成完成
+                    #   - 15s 上限兜底; 超时后 sgs 仍为模板/空 → ai_summary 置空(降级)
+                    summary = ""
+                    deadline = time.time() + 15
+                    last_len = -1
+                    stable_count = 0
+                    _QUARK_TEMPLATE_MARK = "以上内容由AI生成"
+                    while time.time() < deadline:
+                        try:
+                            await page.wait_for_selector(
+                                _QUARK_SUMMARY_SEL, state="attached", timeout=4000
+                            )
+                            await page.wait_for_timeout(600)
+                            summary = await page.evaluate(
+                                """() => {
+                                    const el = document.querySelector('.sgs-container');
+                                    return el ? el.innerText.trim() : '';
+                                }"""
+                            )
+                            cur_len = len(summary)
+                            # 模板占位: 未开始生成, 重置稳定计数继续等
+                            if cur_len <= 100 or _QUARK_TEMPLATE_MARK in summary[:200]:
+                                stable_count = 0
+                                last_len = cur_len
+                                await page.wait_for_timeout(1500)
+                                continue
+                            if cur_len == last_len:
+                                stable_count += 1
+                                if stable_count >= 2:
+                                    break  # 真实内容连续 2 次相同 = 生成完成
+                            else:
+                                stable_count = 0
+                            last_len = cur_len
+                            # 足够长直接收(避免长回答浪费轮询)
+                            if cur_len >= 3000:
+                                break
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(1500)
+
+                    # 模板/占位文本不入库
+                    if len(summary) <= 100 or _QUARK_TEMPLATE_MARK in summary[:200]:
+                        summary = ""
+
+                    # 资讯条目: 从 .results 内的 result 卡片提取
+                    items = await page.evaluate(
+                        """(maxItems) => {
+                        const out = [];
+                        // 资讯卡片: article 下的链接组; 用 article a[href^=http] 提取标题/链接,
+                        // 再用卡片文本解析来源与日期
+                        const cards = document.querySelectorAll('article [class*="result-"]');
+                        const seen = new Set();
+                        for (const card of cards) {
+                            const a = card.querySelector('a[href^="http"]');
+                            if (!a) continue;
+                            const title = (a.textContent || '').trim();
+                            if (title.length < 5 || seen.has(title)) continue;
+                            seen.add(title);
+                            const href = a.href;
+                            const txt = (card.textContent || '').trim();
+                            // 来源: 匹配常见媒体名
+                            const srcM = txt.match(/(新浪财经|新浪|有驾|百家号|今日头条|网易|腾讯|东方财富|证券时报|每经网|财联社|雪球|同花顺|搜狐|凤凰|澎湃|界面|第一财经|21财经|中国证券报|上海证券报|证券日报|华夏时报|经济观察报)/);
+                            const dateM = txt.match(/(20\\d{2})[-/年.](\\d{1,2})[-/月.](\\d{1,2})/);
+                            out.push({
+                                title: title.slice(0, 120),
+                                url: href,
+                                snippet: txt.replace(/window\\._q_wl_sc_\\d+ = Date\\.now\\(\\)/g, '').slice(0, 300),
+                                source_domain: srcM ? srcM[1] : '',
+                                publish_time: dateM ? `${dateM[1]}-${dateM[2].padStart(2,'0')}-${dateM[3].padStart(2,'0')}` : '',
+                            });
+                            if (out.length >= maxItems) break;
+                        }
+                        return out;
+                    }""",
+                        count,
+                    )
+                    # 降级判定: summary 与 items 双空才算失败; 任一有值即返回部分结果
+                    if not summary and not items:
+                        return {"success": False, "error": "夸克未返回结果(可能被风控或查询异常)"}
+                    return {
+                        "success": True,
+                        "query": q,
+                        "count": len(items),
+                        "results": items,
+                        "ai_summary": summary[:4000],
+                        "partial": len(summary) <= 100,
+                        "source": "夸克 AI",
+                    }
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+# ── 20. 文章正文抓取 (站点专用选择器 + 通用启发式兜底) ──
+
+_ARTICLE_SELECTORS = {
+    "eastmoney.com":     (".txtinfos", ".article-content", ".ContentBody", "#ContentBody"),
+    "cls.cn":            (".article-content", ".rich_media_content", "#content"),
+    "stcn.com":          (".article-content", "#content"),
+    "sina.com.cn":       (".article", "#artibody", "#article"),
+    "10jqka.com.cn":     (".main-content", "#content", ".atc-content"),
+    "mp.weixin.qq.com":  (".rich_media_content", "#js_content"),
+}
+
+# 正文截断: 尽量在句子边界(。！？；\n)处截断, 避免切断在句中
+_SENTENCE_BOUNDARIES = ("。", "！", "？", "；", "\n")
+
+
+def _truncate_at_sentence(text: str, limit: int) -> str:
+    """在 limit 内找最后一个句子边界标点截断; 找不到则硬截断。"""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # 边界不能太靠前(低于 limit 的一半则视为无有效边界)
+    floor = limit // 2
+    for sep in _SENTENCE_BOUNDARIES:
+        idx = cut.rfind(sep)
+        if idx >= floor:
+            return cut[: idx + 1].rstrip()
+    return cut.rstrip()
+
+@cached(ttl=300)
+def fetch_article(url: str, max_chars: int = 3000):
+    """抓取网页正文: 标题/发布时间/正文(按域名选择器优先, 通用启发式兜底)。
+
+    安全: 仅允许 http(s) URL; 超时/无正文时返回 error, 由调用方回退 SERP 摘要。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    if not url.lower().startswith(("http://", "https://")):
+        return {"success": False, "error": "仅支持 http/https URL"}
+    try:
+        max_chars = max(500, min(int(max_chars), 20000))
+    except (ValueError, TypeError):
+        max_chars = 3000
+
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.lower()
+    preferred = []
+    for dom, sels in _ARTICLE_SELECTORS.items():
+        if dom in host:
+            preferred = list(sels)
+            break
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                try:
+                    await page.set_viewport_size({"width": 1280, "height": 900})
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    except Exception as e:
+                        return {"success": False, "error": f"页面打开失败: {str(e)[:120]}"}
+
+                    # 智能等待: 优先等待正文容器出现(动态/懒加载页面), 超时则继续走启发式兜底
+                    wait_sel = (preferred[0] if preferred else "article")
+                    try:
+                        await page.wait_for_selector(
+                            wait_sel, state="attached", timeout=8000
+                        )
+                    except Exception:
+                        pass
+
+                    # 信号等待: 正文文本量稳定后再提取（懒加载渐进渲染, 最长 6s 兜底）
+                    async def _article_text_settled():
+                        n = await page.evaluate("() => (document.body ? document.body.innerText.length : 0)")
+                        if n < 100:
+                            return False
+                        await page.wait_for_timeout(400)
+                        return (await page.evaluate("() => (document.body ? document.body.innerText.length : 0)")) == n
+                    await _wait_for_ready(page, _article_text_settled, timeout=6.0, confirm_rounds=1)
+
+                    data = await page.evaluate(
+                        """(preferred) => {
+                        const pick = (q) => {
+                            const el = document.querySelector(q);
+                            return el ? el.textContent.trim() : '';
+                        };
+                        const title = pick('meta[property="og:title"]')
+                            || pick('meta[name="title"]') || document.title || '';
+                        const time = pick('meta[property="article:published_time"]')
+                            || pick('meta[name="publishdate"]')
+                            || pick('meta[name="pubdate"]')
+                            || (document.querySelector('time') ? document.querySelector('time').textContent.trim() : '');
+                        const sels = [
+                            ...(preferred || []),
+                            'article', 'main', '[role="main"]',
+                            '.article-content', '.article', '.content', '.post-content',
+                            '#artibody', '.rich_media_content', '#js_content', '.ContentBody',
+                        ].filter((v, i, a) => a.indexOf(v) === i);
+                        let best = null, bestLen = 0;
+                        for (const s of sels) {
+                            const els = document.querySelectorAll(s);
+                            for (const el of els) {
+                                const t = (el.innerText || '').trim();
+                                if (t.length > bestLen) { best = t; bestLen = t.length; }
+                            }
+                        }
+                        // 兜底: 取 body 文本, 去掉脚本/样式
+                        if (!best || bestLen < 100) {
+                            const b = document.body.cloneNode(true);
+                            b.querySelectorAll('script, style, noscript, iframe, nav, header, footer, aside').forEach(n => n.remove());
+                            best = (b.innerText || '').trim();
+                        }
+                        return { title, time, text: best };
+                    }""",
+                        preferred,
+                    )
+                    text = (data.get("text") or "").strip()
+                    if not text:
+                        return {"success": False, "error": "未提取到正文（可能需要登录/反爬）"}
+                    text = "\n".join(
+                        line.strip() for line in text.split("\n") if line.strip()
+                    )
+                    truncated = len(text) > max_chars
+                    if truncated:
+                        text = _truncate_at_sentence(text, max_chars)
+                    return {
+                        "success": True,
+                        "url": url,
+                        "title": (data.get("title") or "").strip(),
+                        "publish_time": (data.get("time") or "").strip(),
+                        "text": text,
+                        "truncated": truncated,
+                        "source_domain": host,
+                    }
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════════════
+
 ROUTES = {
     "/api/fund-flow":            ("个股资金流+概念(问财)",   fetch_fund_flow_wencai, ["code"]),
     "/api/stock-basic":          ("股本结构(同花顺F10)",     fetch_stock_basic, ["code"]),
@@ -3286,6 +4265,12 @@ ROUTES = {
     "/api/company-events":       ("公司大事(同花顺F10)",    fetch_company_events, ["code"]),
     "/api/industry-hotmap":      ("大盘星图行业热力(东财)",  fetch_industry_hotmap, ["level", "top_n"]),
     "/api/industry-board":       ("行业板块排名(东财页面爬取)", fetch_industry_board, ["top_n"]),
+    "/api/global-news-cls":      ("全球快讯(财联社电报爬取)",  fetch_global_news_cls, ["limit"]),
+    "/api/global-news-em":       ("全球快讯(东财7x24爬取)",   fetch_global_news_em, ["limit"]),
+    "/api/stock-news-em":        ("股市聚焦新闻(东财股票频道)", fetch_stock_news_em, ["limit"]),
+    "/api/search-bing":          ("Bing 搜索(国内直连)",      fetch_search_bing, ["q"]),
+    "/api/search-quark":         ("夸克 AI 搜索(国内直连)",   fetch_search_quark, ["q"]),
+    "/api/fetch-article":        ("文章正文抓取(选择器+启发式)", fetch_article, ["url"]),
 }
 
 
@@ -3412,7 +4397,9 @@ class DataHandler(BaseHTTPRequestHandler):
         elapsed = ""
         if hasattr(self, '_request_time'):
             elapsed = f" [{time.time() - self._request_time:.2f}s]"
-        print(f"[{time.strftime('%H:%M:%S')}] {self.client_address[0]} - {args[0]} {args[1]}{elapsed}")
+        msg = f"{self.client_address[0]} - {args[0]} {args[1]}{elapsed}"
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        logger.info("%s", msg)
 
 _start_time = time.time()
 
@@ -3423,6 +4410,12 @@ def main():
     parser.add_argument("--host", type=str, default=HOST, help=f"监听地址 (默认 {HOST})")
     args = parser.parse_args()
 
+    log_path = _setup_file_logging()
+
+    def _log_and_print(msg: str, level=logging.INFO):
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        logger.log(level, "%s", msg)
+
     # 检查 Chrome CDP 可达性
     import urllib.request, json
     cdp_ok = False
@@ -3430,20 +4423,21 @@ def main():
         resp = urllib.request.urlopen(f"{_WENCAI_CDP}/json/version", timeout=3)
         info = json.loads(resp.read().decode())
         chrome_ver = info.get("Browser", "unknown")
-        print(f"[{time.strftime('%H:%M:%S')}] Chrome CDP: 已连接 ({_WENCAI_CDP}) 版本={chrome_ver[:60]}")
+        _log_and_print(f"Chrome CDP: 已连接 ({_WENCAI_CDP}) 版本={chrome_ver[:60]}")
         cdp_ok = True
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] ⚠ Chrome CDP: 未连接 ({_WENCAI_CDP}) - {e}")
-        print(f"[{time.strftime('%H:%M:%S')}]   依赖 Chrome 的接口(行情/财务/支撑位等)将在首次调用时返回错误")
+        _log_and_print(f"⚠ Chrome CDP: 未连接 ({_WENCAI_CDP}) - {e}", logging.WARNING)
+        _log_and_print("  依赖 Chrome 的接口(行情/财务/支撑位等)将在首次调用时返回错误", logging.WARNING)
 
     server = ThreadingHTTPServer((args.host, args.port), DataHandler)
-    print(f"[{time.strftime('%H:%M:%S')}] 服务启动: http://{args.host}:{args.port}")
-    print(f"[{time.strftime('%H:%M:%S')}] 健康检查: http://{args.host}:{args.port}/api/health")
-    print(f"[{time.strftime('%H:%M:%S')}] 路由列表: http://{args.host}:{args.port}/api/routes")
-    print(f"[{time.strftime('%H:%M:%S')}] 缓存 TTL: {CACHE_TTL}s")
+    _log_and_print(f"服务启动: http://{args.host}:{args.port}")
+    _log_and_print(f"健康检查: http://{args.host}:{args.port}/api/health")
+    _log_and_print(f"路由列表: http://{args.host}:{args.port}/api/routes")
+    _log_and_print(f"缓存 TTL: {CACHE_TTL}s")
+    _log_and_print(f"日志文件: {log_path}")
     if not cdp_ok:
-        print(f"[{time.strftime('%H:%M:%S')}] ⚠ Chrome CDP 不可用，部分功能受限")
-    print(f"[{time.strftime('%H:%M:%S')}] 按 Ctrl+C 停止")
+        _log_and_print("⚠ Chrome CDP 不可用，部分功能受限", logging.WARNING)
+    _log_and_print("按 Ctrl+C 停止")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -30,6 +30,7 @@ import uuid
 import urllib.request
 
 import pandas as pd
+import numpy as np
 import requests as _requests
 
 from .utils import safe_ticker_component
@@ -1282,9 +1283,9 @@ def get_news(
 def get_global_news(
     curr_date: Annotated[str, "Current date yyyy-mm-dd"],
     look_back_days: Annotated[int, "Days to look back"] = 7,
-    limit: Annotated[int, "Max articles"] = 10,
+    limit: Annotated[int, "Max articles"] = 20,
 ) -> str:
-    """Get China/global financial news via direct HTTP (CLS + Eastmoney)."""
+    """Get China/global financial news via CLS telegraph (playwright_service) + Eastmoney 7x24 fallback."""
     start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(
         days=look_back_days
     )
@@ -1292,59 +1293,70 @@ def get_global_news(
 
     all_news: list[dict] = []
 
-    # Source 1: CLS wire (财联社快讯) — direct HTTP
+    # Source 1: CLS wire (财联社电报) — playwright_service 爬取
+    # (原 cls.cn/nodeapi/telegraphList 直连已 404 失效，改由 playwright 拦截页面 api/cache 响应)
     try:
-        cls_url = "https://www.cls.cn/nodeapi/telegraphList"
-        cls_params = {"rn": str(limit), "page": "1"}
-        cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
-        r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
-        d_cls = r_cls.json()
-        for item in d_cls.get("data", {}).get("roll_data", []):
-            title = item.get("title", "") or item.get("brief", "")
-            content = item.get("content", "") or item.get("brief", "")
-            ctime = item.get("ctime", "")
-            # ctime is unix timestamp
-            pub_time = ""
-            if ctime:
-                try:
-                    pub_time = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
-                except (ValueError, TypeError, OSError):
-                    pub_time = str(ctime)
-            all_news.append({
-                "title": title,
-                "content": content,
-                "time": pub_time,
-                "source": "CLS Wire",
-            })
+        from playwright_service.client import PlaywrightClient
+        result = PlaywrightClient().global_news_cls(limit)
+        if result and result.get("success"):
+            for item in result.get("data", []) or []:
+                all_news.append({
+                    "title": item.get("title", ""),
+                    "content": item.get("content", ""),
+                    "time": item.get("time", ""),
+                    "source": "CLS Wire",
+                })
+        else:
+            logger.warning("CLS news via playwright failed: %s",
+                           (result or {}).get("error", "unknown"))
     except Exception as e:
-        logger.warning("CLS news fetch failed: %s", str(e)[:200])
+        logger.warning("CLS news playwright transport failed: %s", str(e)[:200])
 
-    # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
+    # Source 2: Eastmoney 7x24 (东财快讯) — playwright_service 爬取
     try:
-        em_url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
-        em_params = {
-            "client": "web",
-            "biz": "web_724",
-            "fastColumn": "102",
-            "sortEnd": "",
-            "pageSize": str(limit),
-            "req_trace": str(uuid.uuid4()),
-        }
-        em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
-        r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
-        d_em = r_em.json()
-        for item in d_em.get("data", {}).get("fastNewsList", []):
-            title = item.get("title", "")
-            summary = item.get("summary", "")[:200]
-            pub_time = item.get("showTime", "")
-            all_news.append({
-                "title": title,
-                "content": summary,
-                "time": pub_time,
-                "source": "Eastmoney Global",
-            })
+        from playwright_service.client import PlaywrightClient
+        result = PlaywrightClient().global_news_em(limit)
+        if result and result.get("success"):
+            for item in result.get("data", []) or []:
+                all_news.append({
+                    "title": item.get("title", ""),
+                    "content": item.get("content", ""),
+                    "time": item.get("time", ""),
+                    "source": "Eastmoney Global",
+                })
+        else:
+            logger.warning("Eastmoney global news via playwright failed: %s",
+                           (result or {}).get("error", "unknown"))
     except Exception as e:
-        logger.warning("Eastmoney global news fetch failed: %s", e)
+        logger.warning("Eastmoney global news playwright transport failed: %s", str(e)[:200])
+
+    # Source 3: Eastmoney 7x24 (direct HTTP) — 最后兜底 (playwright 不可用时)
+    if not any(n["source"] == "Eastmoney Global" for n in all_news):
+        try:
+            em_url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+            em_params = {
+                "client": "web",
+                "biz": "web_724",
+                "fastColumn": "102",
+                "sortEnd": "",
+                "pageSize": str(limit),
+                "req_trace": str(uuid.uuid4()),
+            }
+            em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
+            r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
+            d_em = r_em.json()
+            for item in d_em.get("data", {}).get("fastNewsList", []):
+                title = item.get("title", "")
+                summary = item.get("summary", "")[:200]
+                pub_time = item.get("showTime", "")
+                all_news.append({
+                    "title": title,
+                    "content": summary,
+                    "time": pub_time,
+                    "source": "Eastmoney Global",
+                })
+        except Exception as e:
+            logger.warning("Eastmoney global news HTTP fallback failed: %s", e)
 
     if not all_news:
         return f"No global news found for {curr_date}"
@@ -1357,8 +1369,23 @@ def get_global_news(
             seen.add(n["title"])
             unique.append(n)
 
+    # Interleave sources so one source cannot fill up the entire limit
+    cls_items = [n for n in unique if n["source"] == "CLS Wire"]
+    em_items = [n for n in unique if n["source"] != "CLS Wire"]
+    interleaved: list[dict] = []
+    i = j = 0
+    while len(interleaved) < limit and (i < len(cls_items) or j < len(em_items)):
+        if i < len(cls_items):
+            interleaved.append(cls_items[i])
+            i += 1
+        if len(interleaved) >= limit:
+            break
+        if j < len(em_items):
+            interleaved.append(em_items[j])
+            j += 1
+
     news_str = ""
-    for n in unique[:limit]:
+    for n in interleaved:
         news_str += f"### {n['title']} (source: {n['source']})\n"
         if n.get("content"):
             snippet = (
@@ -2326,159 +2353,276 @@ def get_industry_comparison(
 # ---------------------------------------------------------------------------
 # 18. Chip Distribution (筹码分布 - Python CYQ algorithm)
 # ---------------------------------------------------------------------------
-# 参数校准（2026-08，对照东财官方筹码分布 300750：获利63.51%/平均成本384.2/
-# 90%集中度27.45%/70%集中度10.71%）：窗口 350 根日K + 换手衰减系数 0.5 为
-# 最优拟合（62.3%/377.0/25.45%/10.89%，综合误差最小）。更短的窗口(120根，
-# 旧实现)会严重低估获利比例与集中度。
+# 模型: 自归一化迭代（chip = chip*(1-weight) + new_chip*weight，总量恒为1），
+# 与通达信 WINNER/COST 同构。2026-08 经 fengwo(通达信DLL) + 东财官方 15 只
+# 股票(2026-08-05)交叉验证: 平均误差 获利1.35pt / 90%集中度0.42pt / 70%0.61pt。
+#
+# 官方口径结论（实测）:
+#   - 数据: 前复权(fqt=1)，窗口 ~350 根（约1.4年）
+#   - 三角分布峰值: (最高+最低)/2（通达信 hlavg）
+#   - 历史换手衰减系数: 1.0（通达信标准；此前"自动分档/0.5"与官方系统性背离）
+#   - 量能加权 / 十大流通股东换手还原: 官方未采用，保留为可选参数(默认关闭)
+#
+# 窗口: 350 根前复权日K（实际根数以数据源返回为准）。
 
-_CYQ_PRICE_BUCKETS = 150
+# 价格分桶: 桶宽目标 = 窗口最高价 * _CYQ_BUCKET_PCT (0.05%)，桶数限制在
+# [_CYQ_BUCKETS_MIN, _CYQ_BUCKETS_MAX]。等宽固定150桶在高价股(如600519茅台
+# 桶宽~13元)上分位/成本误差可达±半桶，动态分桶使桶宽随价格缩放到~0.05%，
+# 茅台约0.7元/桶、601288约0.003元/桶，与官方0.5元级精度对齐。
+_CYQ_BUCKET_PCT = 0.0005
+_CYQ_BUCKETS_MIN = 150
+_CYQ_BUCKETS_MAX = 2000
 _CYQ_KLINE_COUNT = 350
-_CYQ_DECAY_COEFF = 0.5
+_CYQ_DECAY_COEFF = 1.0  # 通达信标准衰减系数（decay_coeff=None 时按此兜底）
+# 可选: 按近60日均换手率自动分档推断（仅 decay_coeff=None 显式启用时生效）
+_CYQ_AUTO_TURNS = ((0.08, 0.5), (0.05, 0.8), (0.01, 1.0), (0.0, 1.5))
+# 可选: 量能加权(vol_weighted=True 时生效) — 当日筹码替换比例乘以相对量能，
+# 大成交日贡献更大。官方未采用，默认关闭。
+_CYQ_VOL_WINDOW = 60
+_CYQ_VOL_RATIO_MIN = 0.5
+_CYQ_VOL_RATIO_MAX = 3.0
+# 可选: 十大流通股东"死筹"换手还原（top10_ratios 传入时生效）—
+# 实际换手率 = 名义换手率/(1-稳定占比)，仅统计持股≥4季度不变的股东。
+# 官方未采用，默认关闭（helpers 保留供可选调用）。
+_CYQ_TOP10_GATE = 0.30          # 稳定占比超过30%才调整
+_CYQ_TOP10_MIN_PERIODS = 4      # 需在≥4期(≈4季度)中持续在榜
+_CYQ_TOP10_MAX_CHANGE = 50.0    # 各期持股变动≤50%视为稳定(%)，送转/解禁等口径噪声的宽容阈值
+_CYQ_TOP10_MAX_RATIO = 0.95     # 分母保护上限
 
 
-def _em_fetch_klines(code: str, count: int = _CYQ_KLINE_COUNT) -> list[dict]:
-    """Fetch daily K-lines from Eastmoney push2his for CYQ calculation.
+def _parse_pct_text(s) -> float:
+    """解析百分比文本: '22.77%' -> 22.77; '不变'/''/None -> 0.0; '-1.43%' -> -1.43"""
+    if s is None:
+        return 0.0
+    m = _re.search(r"[-+]?\d+(?:\.\d+)?", str(s))
+    return float(m.group()) if m else 0.0
 
-    Returns list of dicts with keys: date, open, close, high, low, volume, amount, turnover.
+
+def _stable_top10_ratio_series(holder_data: dict) -> list[tuple[str, float]] | None:
+    """从股东研究数据计算各期"持股超4季度不变"的十大流通股东占比合计。
+
+    口径（天狼50/指南针）: 仅统计在≥4期股东快照中持续在榜且持股变动不超过
+    _CYQ_TOP10_MAX_CHANGE 的股东（国资/战投/公募重仓=死筹），量化基金/游资等
+    短线股东进出快、不计入。返回 [(period_date, ratio), ...] 按日期升序；
+    无数据或无可判定稳定股东时返回 None。
     """
-    market = "1" if code.startswith(("6", "9")) else "0"
-    secid = f"{market}.{code}"
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": "101",
-        "fqt": "0",
-        "end": "20500101",
-        "lmt": str(count),
-    }
-    r = _em_get(url, params=params, timeout=15)
-    d = r.json()
-    klines = d.get("data", {}).get("klines", [])
-    records = []
-    for k in klines:
-        parts = k.split(",")
-        if len(parts) >= 11:
-            try:
-                records.append({
-                    "date": parts[0],
-                    "open": float(parts[1]),
-                    "close": float(parts[2]),
-                    "high": float(parts[3]),
-                    "low": float(parts[4]),
-                    "volume": float(parts[5]),
-                    "amount": float(parts[6]),
-                    "amplitude": float(parts[7]),
-                    "pct_chg": float(parts[8]),
-                    "turnover": float(parts[10]),
-                })
-            except (ValueError, IndexError):
+    if not isinstance(holder_data, dict):
+        return None
+    periods = holder_data.get("top10Holders")
+    if not periods:
+        return None
+    parsed = []
+    for per in periods:
+        date = per.get("period")
+        holders = per.get("holders") or []
+        names = {}
+        for h in holders:
+            nm = str(h.get("name") or "").strip()
+            if not nm:
                 continue
-    return records
+            names[nm] = (_parse_pct_text(h.get("ratio")), _parse_pct_text(h.get("changePct")))
+        if names:
+            parsed.append((str(date), names))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda x: x[0])
+
+    all_names = {nm for _, ns in parsed for nm in ns}
+    stable_names = set()
+    for nm in all_names:
+        appear = [ns[nm] for _, ns in parsed if nm in ns]
+        if len(appear) < _CYQ_TOP10_MIN_PERIODS:
+            continue
+        changes = [abs(ch) for _, ch in appear]
+        if changes and max(changes) <= _CYQ_TOP10_MAX_CHANGE:
+            stable_names.add(nm)
+    if not stable_names:
+        return None
+
+    series = []
+    for date, ns in parsed:
+        total = sum(ratio for nm, (ratio, _) in ns.items() if nm in stable_names)
+        series.append((date, min(total / 100.0, _CYQ_TOP10_MAX_RATIO)))
+    return series
 
 
-def _compute_cyq(klines: list[dict]) -> dict:
+def _top10_ratio_for_date(series: list[tuple[str, float]] | None, date: str) -> float:
+    """按日期取稳定的十大流通股东占比（前向填充，早于首期用首期值）。"""
+    if not series:
+        return 0.0
+    best = None
+    for d, r in series:
+        if d <= date:
+            best = r
+        else:
+            break
+    return best if best is not None else series[0][1]
+
+
+def _infer_decay_coeff(rows: list[tuple]) -> float:
+    """按近60日均换手率自动推断历史换手衰减系数（分档挤"成交量水分"）。
+
+    rows: 预处理后的 (date, low, high, close, volume, turnover%) 列表。
+    """
+    turns = [r[5] for r in rows[-60:]]
+    if not turns:
+        return _CYQ_DECAY_COEFF
+    avg_turn = sum(turns) / len(turns) / 100.0  # 百分比 -> 小数
+    for threshold, coef in _CYQ_AUTO_TURNS:
+        if avg_turn > threshold:
+            return coef
+    return _CYQ_DECAY_COEFF
+
+
+def _compute_cyq(klines: list[dict], decay_coeff: float = 1.0,
+                 top10_ratios: list[tuple[str, float]] | None = None,
+                 vol_weighted: bool = False) -> dict:
     """Compute chip distribution (CYQ) from K-line data.
 
-    Algorithm:
-    1. Determine price range from all K-lines (min low ~ max high)
-    2. Create 150 price buckets
-    3. For each day, decay existing chips by (1 - turnover/100 * decay_coeff)
-    4. Distribute today's volume as a triangle between low~high, peak at close
-    5. After processing all days, compute profit ratio, avg cost, concentration
+    通达信 WINNER/COST 同构的自归一化迭代模型（2026-08 经 fengwo 通达信DLL +
+    东财官方 15 只股票验证，平均误差 获利1.35pt / 90%0.42pt / 70%0.61pt）:
+    1. 价格轴: 动态分桶——桶宽目标 = 窗口最高价 * 0.05%，桶数 150~2000，
+       分位/成本精度达价格 0.05% 级
+    2. 每日: weight = min(换手率/100 * 衰减系数, 1.0)
+             chip = chip * (1 - weight) + new_chip * weight
+       当日新筹码 new_chip 为 low~high 间三角分布（峰值 (high+low)/2，
+       通达信 hlavg 口径），归一化后以 weight 比例替换旧筹码，总量恒为 1
+    3. 健壮处理: 过滤 NaN/0 成交量/非法价格的交易日（停牌日跳过），
+       换手率为 NaN 时视为 0（当日不衰减），hi<=lo 退化日筹码落入单桶；
+       分位价用桶内线性插值（COST(N) 亚桶精度）
 
-    decay_coeff (换手衰减系数): 0.5 经东财官方数据校准。系数越小，历史筹码
-    衰减越慢（对低换手大盘股保留更多历史成本）。
+    Args:
+        klines: 日K列表（含 date/open/close/high/low/volume/turnover）。
+            官方口径为前复权数据（见 get_astock_chip_distribution 的 fqt=1 请求）。
+        decay_coeff: 历史换手衰减系数，默认 1.0（通达信标准）。None=按近60日
+            均换手自动分档推断（>8%->0.5, 5~8%->0.8, <1%->1.5, 其余->1.0，
+            与官方系统性背离，仅显式启用）。
+        top10_ratios: [(period_date, 稳定十大流通股东占比), ...] 按日期升序，
+            将名义换手率还原为实际换手率（占比>30%时生效）。官方未采用，
+            默认 None 不调整。
+        vol_weighted: 是否按相对量能(vol/近60日均量, 裁剪0.5~3)放大当日权重，
+            使大成交日贡献更大。官方未采用，默认 False。
 
     Returns dict with: profit_ratio, avg_cost, cost_90_low, cost_90_high,
                        concentration_90, cost_70_low, cost_70_high, concentration_70
     """
-    if len(klines) < 10:
+    # ── 健壮预处理: 过滤 NaN/0/非法交易日 ──
+    rows = []
+    for k in klines:
+        try:
+            date = str(k.get("date") or "")
+            lo = float(k.get("low"))
+            hi = float(k.get("high"))
+            cl = float(k.get("close"))
+            vol = float(k.get("volume") or 0)
+            turn = float(k.get("turnover") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not (vol > 0) or not (hi > 0) or not (lo > 0) or hi < lo:
+            continue
+        if not (turn >= 0):  # NaN 换手率视为 0
+            turn = 0.0
+        rows.append((date, lo, hi, cl, vol, turn))
+    if len(rows) < 10:
         return {}
 
-    prices_low = [k["low"] for k in klines]
-    prices_high = [k["high"] for k in klines]
-    p_min = min(prices_low)
-    p_max = max(prices_high)
+    if decay_coeff is None:
+        decay_coeff = _infer_decay_coeff(rows)
+
+    p_min = min(r[1] for r in rows)
+    p_max = max(r[2] for r in rows)
     if p_max <= p_min:
         return {}
 
-    bucket_size = (p_max - p_min) / _CYQ_PRICE_BUCKETS
+    # 动态分桶: 桶宽目标 = 最高价 * 0.05%，桶数限制 150~2000
+    span = p_max - p_min
+    target_bucket = max(p_max * _CYQ_BUCKET_PCT, 1e-9)
+    n_buckets = int(min(max(span / target_bucket, _CYQ_BUCKETS_MIN), _CYQ_BUCKETS_MAX))
+    bucket_size = span / n_buckets
     if bucket_size <= 0:
         return {}
 
-    # chip[b] = volume of chips at price bucket b
-    chip = [0.0] * _CYQ_PRICE_BUCKETS
+    # 桶中心价格
+    centers = np.linspace(p_min + bucket_size / 2.0, p_max - bucket_size / 2.0, n_buckets)
 
-    for k in klines:
-        # Decay existing chips by turnover rate (衰减系数见 _CYQ_DECAY_COEFF)
-        turnover = k.get("turnover", 0)
-        decay = max(0.0, 1.0 - turnover / 100.0 * _CYQ_DECAY_COEFF)
-        for b in range(_CYQ_PRICE_BUCKETS):
-            chip[b] *= decay
+    # ── 逐日自归一迭代（通达信标准；量能/死筹调整为可选）──
+    vols = [r[4] for r in rows]
+    chip = np.zeros(n_buckets, dtype=np.float64)
+    for i, (date, lo, hi, cl, vol, turn) in enumerate(rows):
+        weight = min(turn / 100.0 * decay_coeff, 1.0)
+        if vol_weighted:
+            # 相对量能 = 当日量 / 前60日均量（不含当日），裁剪防极端放量
+            start = max(0, i - _CYQ_VOL_WINDOW)
+            avg_vol = sum(vols[start:i]) / (i - start) if i > start else vol
+            vol_ratio = vol / avg_vol if avg_vol > 0 else 1.0
+            vol_ratio = min(max(vol_ratio, _CYQ_VOL_RATIO_MIN), _CYQ_VOL_RATIO_MAX)
+            weight = min(weight * vol_ratio, 1.0)
+        if top10_ratios:
+            # 死筹调整: 名义换手率 -> 实际换手率（稳定占比>30%才启用）
+            top10_r = _top10_ratio_for_date(top10_ratios, date)
+            if top10_r > _CYQ_TOP10_GATE:
+                weight = min(weight / (1.0 - top10_r), 1.0)
 
-        # Distribute today's volume as triangle: low~close~high
-        vol = k.get("volume", 0)
-        if vol <= 0:
-            continue
+        new_chip = np.zeros(n_buckets, dtype=np.float64)
 
-        lo = k["low"]
-        hi = k["high"]
-        cl = k["close"]
-        if hi <= lo:
-            b_idx = int((cl - p_min) / bucket_size)
-            if 0 <= b_idx < _CYQ_PRICE_BUCKETS:
-                chip[b_idx] += vol
-            continue
-
-        # Triangle distribution: peak at close, linear to low and high
-        for b in range(_CYQ_PRICE_BUCKETS):
-            bucket_price = p_min + (b + 0.5) * bucket_size
-            if bucket_price < lo or bucket_price > hi:
-                continue
-            if bucket_price <= cl:
-                if cl > lo:
-                    weight = (bucket_price - lo) / (cl - lo)
-                else:
-                    weight = 1.0
+        if hi > lo:
+            # 通达信三角分布: 峰值 (high+low)/2，向两端线性衰减
+            pk = (hi + lo) / 2.0
+            idx = np.where((centers >= lo) & (centers <= hi))[0]
+            if len(idx) == 0:
+                # 当日价格区间完全落在桶间缝隙（罕见）: 落入最近桶
+                b = int(np.clip((pk - p_min) / bucket_size, 0, n_buckets - 1))
+                new_chip[b] = 1.0
             else:
-                if hi > cl:
-                    weight = (hi - bucket_price) / (hi - cl)
-                else:
-                    weight = 1.0
-            chip[b] += vol * weight
+                # 三角分布: 峰值 (high+low)/2（通达信 hlavg）, 向 low/high 线性衰减
+                c_sel = centers[idx]
+                left = c_sel <= pk
+                li = idx[left]
+                ri = idx[~left]
+                if len(li):
+                    if pk > lo:
+                        new_chip[li] = (centers[li] - lo) / (pk - lo)
+                    else:
+                        new_chip[li] = 1.0
+                if len(ri):
+                    if hi > pk:
+                        new_chip[ri] = (hi - centers[ri]) / (hi - pk)
+                    else:
+                        new_chip[ri] = 1.0
+                s = new_chip.sum()
+                if s > 0:
+                    new_chip /= s
+        else:
+            b = int(np.clip((pk - p_min) / bucket_size, 0, n_buckets - 1))
+            new_chip[b] = 1.0
 
-    # Normalize chip distribution
-    total_chip = sum(chip)
-    if total_chip <= 0:
+        chip = chip * (1.0 - weight) + new_chip * weight
+
+    total = chip.sum()
+    if total <= 0:
         return {}
+    chip /= total
 
-    # Profit ratio: chips below current price
-    current_price = klines[-1]["close"]
-    profit_ratio = 0.0
-    for b in range(_CYQ_PRICE_BUCKETS):
-        bucket_price = p_min + (b + 0.5) * bucket_size
-        if bucket_price <= current_price:
-            profit_ratio += chip[b]
-    profit_ratio /= total_chip
+    # ── 衍生指标 ──
+    current_price = rows[-1][3]  # 最后一根有效K线的收盘价
+    profit_ratio = float(chip[centers <= current_price].sum())
+    avg_cost = float((centers * chip).sum())
 
-    # Average cost
-    avg_cost = 0.0
-    for b in range(_CYQ_PRICE_BUCKETS):
-        bucket_price = p_min + (b + 0.5) * bucket_size
-        avg_cost += bucket_price * chip[b]
-    avg_cost /= total_chip
+    cum = np.cumsum(chip)
 
-    # Find percentile prices
-    def _percentile_price(pct):
-        target = pct * total_chip
-        cum = 0.0
-        for b in range(_CYQ_PRICE_BUCKETS):
-            cum += chip[b]
-            if cum >= target:
-                return p_min + (b + 0.5) * bucket_size
-        return p_max
+    def _percentile_price(pct: float) -> float:
+        """COST(N) 分位价: 桶内线性插值（亚桶精度）。"""
+        i = int(np.searchsorted(cum, pct))
+        if i <= 0:
+            return float(centers[0])
+        if i >= n_buckets:
+            return float(centers[-1])
+        c_prev = cum[i - 1]
+        c_cur = cum[i]
+        if c_cur <= c_prev:
+            return float(centers[i])
+        f = (pct - c_prev) / (c_cur - c_prev)
+        return float(centers[i - 1] + f * (centers[i] - centers[i - 1]))
 
     cost_90_low = _percentile_price(0.05)
     cost_90_high = _percentile_price(0.95)
@@ -2506,20 +2650,22 @@ def get_astock_chip_distribution(
 ) -> str:
     """Get chip distribution (筹码分布) for an A-stock.
 
-    Computes profit ratio, average cost, 90%/70% concentration zones
-    using a Python CYQ algorithm on ~350 daily K-lines (不复权, 换手衰减系数0.5).
+    通达信口径（经 fengwo 通达信DLL + 东财官方 15 只股票交叉验证）:
+    ~350 根前复权(fqt=1)日K + 自归一三角分布(峰值 (H+L)/2) + 衰减系数 1.0。
+    平均误差 vs 官方: 获利 1.35pt / 90% 0.42pt / 70% 0.61pt / 成本 2.45%。
     """
     code = safe_ticker_component(ticker)
     lines = [f"# 筹码分布 | {code}"]
 
     try:
         # 数据源: playwright_service 浏览器通道（规避东财 push2his 直连风控；
-        # 服务端会通过浏览器上下文重取 lmt=350、fqt=0 不复权完整历史）。
+        # 服务端通过浏览器上下文重取 lmt=350、fqt=1 前复权历史——官方口径）。
         # records 含 date/open/close/high/low/volume/turnover，与 _compute_cyq 所需字段一致。
         # 350根需要 页面加载(≤15s)+浏览器重取(≤30s)，共享单例客户端默认30s超时会间歇性
         # TimeoutError，这里用独立长超时客户端。
         from playwright_service.client import PlaywrightClient
-        res = PlaywrightClient(timeout=90).stock_kline_full(code, _CYQ_KLINE_COUNT)
+        client = PlaywrightClient(timeout=90)
+        res = client.stock_kline_full(code, _CYQ_KLINE_COUNT, fqt=1)
         if not res.get("success"):
             return f"[筹码分布] {code}: {res.get('error', '')}"
         klines = res.get("data", []) or []
@@ -2536,7 +2682,7 @@ def get_astock_chip_distribution(
         c90 = cyq["concentration_90"]
         c70 = cyq["concentration_70"]
 
-        lines.append(f"# 数据源: 东财行情(playwright, {len(klines)}根) + Python CYQ算法")
+        lines.append(f"# 数据源: 东财行情(playwright, {len(klines)}根, 前复权) + 通达信CYQ算法")
         lines.append("")
 
         # Chip health assessment

@@ -21,6 +21,8 @@ DEFAULT_CONFIG = {
     # provider-specific URL here would leak (e.g. OpenAI's /v1 was previously
     # being forwarded to Gemini, producing malformed request URLs).
     "backend_url": None,
+    # 网页搜索引擎: "quark"(夸克 AI, 结构化总结+资讯) | "bing"(Bing cn, SERP 列表)
+    "search_engine": "quark",
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
@@ -60,7 +62,7 @@ DEFAULT_CONFIG = {
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
-    "max_recur_limit": 100,
+    "max_recur_limit": 150,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {

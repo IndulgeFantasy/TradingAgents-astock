@@ -716,6 +716,136 @@ def get_industry_hotmap(
         return f"[行业热力] 获取异常: {e}"
 
 
+# ═══════════════════════════════════════════════════════════════
+# 搜索引擎 (Bing 国内直连) + 文章正文抓取
+# ═══════════════════════════════════════════════════════════════
+
+@tool("get_web_search")
+def get_web_search(
+    query: Annotated[str, "搜索词，如 '宁德时代 欧盟反补贴' / '证监会 减持新规' / '白酒板块 资金'"],
+    count: Annotated[int, "返回结果条数 1-20，默认 20"] = 20,
+    freshness: Annotated[str, "时间过滤: ''(不限) / 'day'(24小时) / 'week'(一周) / 'month'(一月)，默认 week"] = "week",
+) -> str:
+    """网页搜索（国内直连，无需代理）: 返回标题/URL/摘要/来源域名/发布时间。
+
+    搜索引擎由配置 search_engine 决定: quark(夸克 AI, 含 AI 结构化总结) 或 bing(Bing cn)。
+    用于检索 get_news 覆盖不到的定向问题（特定事件、传闻、政策原文、行业动态）。
+    命中权威来源（财联社/证券时报/东财等）且需要看细节时，可再调用 get_article_content 抓正文。
+    """
+    try:
+        from tradingagents.dataflows.config import get_config
+
+        engine = (get_config().get("search_engine") or "quark").strip().lower()
+        client = _get_client()
+        if engine == "bing":
+            result = client.search_bing(query, count, freshness)
+            engine_label = "Bing (cn)"
+        else:
+            result = client.search_quark(query, min(count, 20))
+            engine_label = "夸克 AI"
+        if not result.get("success"):
+            return f"[搜索] {query}: {result.get('error', '')}"
+        results = result.get("results", [])
+        if not results and not result.get("ai_summary"):
+            return f"[搜索] {query}: 无结果"
+        lines = [
+            f"# 网页搜索: {query} | 共 {result.get('count', len(results))} 条",
+            f"# 数据源: {engine_label}",
+            "",
+        ]
+        ai_summary = result.get("ai_summary", "")
+        if ai_summary:
+            lines.append("## AI 总结")
+            lines.append(ai_summary.strip())
+            lines.append("")
+        if results:
+            lines.append("## 搜索结果")
+            for i, r in enumerate(results, 1):
+                lines.append(f"### [{i}] {r.get('title', '')}")
+                if r.get("publish_time"):
+                    lines.append(f"  时间: {r['publish_time']}")
+                if r.get("source_domain"):
+                    lines.append(f"  来源: {r['source_domain']}")
+                if r.get("snippet"):
+                    lines.append(f"  摘要: {r['snippet']}")
+                if r.get("url"):
+                    lines.append(f"  链接: {r['url']}")
+                lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[搜索] 获取异常: {e}"
+
+
+@tool("get_stock_news")
+def get_stock_news(
+    limit: Annotated[int, "返回条数 1-120，默认 120（全量）"] = 120,
+) -> str:
+    """东财股票频道新闻汇总（https://stock.eastmoney.com/ 页面爬取）。
+
+    按区块返回重点栏目新闻：股市聚焦(焦点/题材/个股/市场/主力)、大盘分析、板块聚焦、
+    行业研究、热门股追踪、主力动态、股市直播、港股聚焦、亚太市场等。
+    每条含: 完整标题/文章链接/发布时间(如有)/所属区块。
+    用于快速浏览当日 A 股市场要闻全貌，补充 get_news/get_global_news 的覆盖。
+    """
+    try:
+        client = _get_client()
+        result = client.stock_news_em(limit)
+        if not result.get("success"):
+            return f"[股市新闻] 获取失败: {result.get('error', '')}"
+        items = result.get("data", [])
+        if not items:
+            return "[股市新闻] 无数据"
+        lines = [
+            f"# 东财股市聚焦新闻 (stock.eastmoney.com) | 共 {result.get('total', len(items))} 条，显示 {len(items)} 条",
+            f"# 获取时间: {_now()}",
+            "",
+        ]
+        for it in items:
+            sec = it.get("section", "")
+            title = it.get("title", "")
+            t = it.get("time", "")
+            url = it.get("url", "")
+            prefix = f"[{sec}] " if sec else ""
+            time_str = f" ({t})" if t else ""
+            lines.append(f"### {prefix}{title}{time_str}")
+            if url:
+                lines.append(f"  链接: {url}")
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[股市新闻] 获取异常: {e}"
+
+
+@tool("get_article_content")
+def get_article_content(
+    url: Annotated[str, "文章完整 URL（必须是 http/https）"],
+    max_chars: Annotated[int, "正文最大字符数，默认 3000"] = 3000,
+) -> str:
+    """打开网页抓取正文（CDP 真实浏览器）: 返回标题/发布时间/正文文本。
+
+    站点专用选择器（东财/财联社/新浪/证券时报/同花顺/微信）+ 通用启发式兜底。
+    用于搜索结果命中权威来源后阅读全文细节；抓取失败时回退 SERP 摘要。
+    """
+    try:
+        client = _get_client()
+        result = client.fetch_article(url, max_chars)
+        if not result.get("success"):
+            return f"[正文抓取] {url}: {result.get('error', '')}"
+        lines = [
+            f"# {result.get('title', '')}",
+            f"# 来源: {result.get('source_domain', '')}",
+        ]
+        if result.get("publish_time"):
+            lines.append(f"# 发布时间: {result['publish_time']}")
+        lines.append("")
+        lines.append(result.get("text", ""))
+        if result.get("truncated"):
+            lines.append(f"\n...(已截断，全文超 {max_chars} 字符)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[正文抓取] 获取异常: {e}"
+
+
 def get_concept_blocks_playwright(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
