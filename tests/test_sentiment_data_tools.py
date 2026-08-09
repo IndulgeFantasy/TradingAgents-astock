@@ -1,8 +1,7 @@
-"""数据驱动的情绪分析师（#61）。
+"""数据驱动的情绪分析师。
 
-情绪分析师原本只有 `get_news` 一个工具，只能从新闻语气推断情绪——而"新闻听起来
-利好"和"资金正在流出"完全可能同时发生。现在补上资金流 / 量价 / 强势股榜三样硬
-数据。
+情绪分析师不只读新闻：资金流是最硬的情绪证据，大盘情绪传导与行业热力给情绪
+广度，新闻负责解释成因——而"新闻听起来利好"和"资金正在流出"完全可能同时发生。
 
 这里锁的是两件最容易漂的事：
 1. 分析师绑定的工具 与 图里 ToolNode 注册的工具 必须一致——不一致时模型会调用一个
@@ -25,11 +24,11 @@ def _tool_names_in_source(func) -> set:
             and not t.strip().startswith("#")}
 
 
-EXPECTED_TOOLS = {"get_news", "get_fund_flow", "get_hot_stocks", "get_stock_data"}
+EXPECTED_TOOLS = {"get_news", "get_fund_flow", "get_market_context", "get_industry_hotmap"}
 
 
 def test_analyst_binds_quantitative_tools():
-    """光有新闻不足以判断情绪，资金流/量价/热度榜必须都在。"""
+    """光有新闻不足以判断情绪，资金流/大盘情绪/行业热力必须都在。"""
     assert _tool_names_in_source(sma.create_social_media_analyst) == EXPECTED_TOOLS
 
 
@@ -52,11 +51,11 @@ def test_prompt_names_every_bound_tool():
     """提示词点名的工具必须真的绑上了，否则模型照着调会调空。"""
     src = inspect.getsource(sma.create_social_media_analyst)
     for tool in EXPECTED_TOOLS:
-        assert f"`{tool}(" in src, f"提示词里没有引导模型使用 {tool}"
+        assert f"`{tool}(" in src or f"{tool}()" in src, f"提示词里没有引导模型使用 {tool}"
 
 
 def test_prompt_requires_divergence_check():
-    """资金面与消息面背离是这次改造最有价值的产出，必须强制写进报告。"""
+    """资金面与消息面背离是情绪分析最有价值的产出，必须强制写进报告。"""
     src = inspect.getsource(sma.create_social_media_analyst)
     assert "背离" in src
 
