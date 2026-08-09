@@ -8,6 +8,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_language_instruction,
     get_news,
     get_stock_news,
+    get_f10_news,
     retry_report_generation,
 )
 from tradingagents.dataflows.config import get_config
@@ -46,6 +47,7 @@ def create_news_analyst(llm):
             get_web_search,
             get_article_content,
             get_stock_news,
+            get_f10_news,
         ]
 
         system_message = (
@@ -67,9 +69,10 @@ def create_news_analyst(llm):
             "\n- `get_global_news(curr_date, look_back_days, limit)`：获取宏观经济和市场整体新闻"
             "\n- `get_web_search(query, count, freshness)`：网页搜索（国内直连，引擎由配置 search_engine 决定，默认夸克 AI 含结构化 AI 总结，可切 Bing），检索定向问题——特定事件/传闻/政策原文/行业动态，返回标题/URL/摘要/来源域名/发布时间。用于补充 get_news 覆盖不到的深度信息"
             "\n- `get_article_content(url, max_chars)`：打开搜索结果中的链接抓取正文（东财/财联社/新浪/证券时报/同花顺/微信有专用解析），命中权威来源且需看细节时调用；抓取失败回退摘要"
+            "\n- `get_f10_news(ticker, limit)`：获取个股 F10 新闻公告+机构研报（同花顺F10口径，含新闻标题/日期/来源/链接+研报评级/机构/日期），补充 get_news 的个股新闻覆盖"
             "\n- `get_stock_news(limit)`：东财股票频道重点栏目新闻汇总（股市聚焦/大盘分析/板块聚焦/行业研究/热门股追踪/主力动态/股市直播等，含完整标题+链接+所属区块），快速浏览当日 A 股市场要闻全貌"
             "\n\n📡 最佳使用时序（严格按此顺序）："
-            "\n① 先调用 get_news(ticker, ...) + get_global_news(...) 覆盖常规新闻（财联社/东财结构化快讯作为报告底座）"
+            "\n① 先调用 get_news(ticker, ...) + get_global_news(...) 覆盖常规新闻（财联社/东财结构化快讯作为报告底座）；再调用 get_f10_news(ticker, ...) 补充 F10 口径个股新闻公告与机构研报（研报评级/机构观点用于交叉验证市场预期）"
             "\n② 识别信息缺口（政策原文核实/传闻交叉验证/突发行业事件/时间窗覆盖不到）后再用 get_web_search 定向检索"
             "\n③ 仅当搜索结果命中权威源（财联社/证券时报/东财/新浪）且摘要不足时，用 get_article_content 读全文"
             "\n④ 基于以上信息撰写报告。注意区分官方消息与市场传闻，来源权重：财联社快讯 > 新华财经/证券时报 > 东方财富/同花顺。"

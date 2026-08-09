@@ -7,7 +7,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_hot_stocks,
     get_industry_comparison,
     get_industry_hotmap,
-    get_insider_transactions,
+    get_company_events,
     get_language_instruction,
     get_limit_up_pool,
     get_news,
@@ -33,7 +33,7 @@ def create_hot_money_tracker(llm):
         tools = [
             get_stock_kline_full,
             get_news,
-            get_insider_transactions,
+            get_company_events,
             get_hot_stocks,
             get_northbound_flow,
             get_concept_blocks,
@@ -56,7 +56,7 @@ def create_hot_money_tracker(llm):
             "\n- **大股东/机构行为**：大股东增减持、机构调研频次变化、定增/配股等融资行为反映内部人态度"
             "\n\n分析方法："
             "\n1. 先调用 get_stock_kline_full(code, days) 获取近期 K 线和成交量数据（含换手率），识别量价异动"
-            "\n2. 调用 get_stock_holder 获取股东人数变化和前十大流通股东变动，判断主力筹码动向；调用 get_stock_position 获取机构持股明细；调用 get_insider_transactions 获取公司大事（重要事件+高管持股变动+股东持股变动+担保+违规+机构调研），判断内部人交易和公司治理动向"
+            "\n2. 调用 get_stock_holder 获取股东人数变化和前十大流通股东变动，判断主力筹码动向；调用 get_stock_position 获取机构持股明细；调用 get_company_events 获取公司大事（重要事件+高管持股变动+股东持股变动+担保+违规+机构调研），判断内部人交易和公司治理动向"
             "\n3. 调用 get_news 搜索游资、龙虎榜、主力资金相关新闻"
             "\n4. 调用 get_hot_stocks 获取当日强势股及题材归因（同花顺编辑部人工标注），识别热点板块轮动"
             "\n5. 调用 get_northbound_flow 获取北向资金流向（注意：交易所自2024年起停止发布北向实时净买入数据，工具会返回「已停止发布」提示和南向资金数据作为参考）"
@@ -64,7 +64,7 @@ def create_hot_money_tracker(llm):
             "\n\n请使用以下工具："
             "\n- `get_stock_kline_full(code, days)`：获取 K 线和成交量数据（含换手率/涨跌幅）"
             "\n- `get_news(ticker, start_date, end_date)`：搜索游资/资金流向相关新闻，ticker 必须使用目标股票的 6 位代码"
-            "\n- `get_insider_transactions(ticker)`：获取公司大事（同花顺F10 event.html，含近期重要事件(财报披露/公告/融资融券/大宗交易/业绩预告/股东大会/分红/回购/股权质押/股东增减持)+高管持股变动+股东持股变动+担保明细+违规处理+机构调研），判断内部人交易和公司治理动向"
+            "\n- `get_company_events(ticker)`：获取公司大事（同花顺F10 event.html，含近期重要事件(财报披露/公告/融资融券/大宗交易/业绩预告/股东大会/分红/回购/股权质押/股东增减持)+高管持股变动+股东持股变动+担保明细+违规处理+机构调研），判断内部人交易和公司治理动向"
             "\n- `get_stock_holder(ticker)`：获取股东研究数据（10期股东人数时序含人均流通股/人均持股金额、5期前十大流通股东含变动比例、退出前十大股东、同业对比），判断筹码集中度和主力动向"
             "\n- `get_hot_stocks(curr_date)`：获取当日涨停股 + 题材归因 reason tags（同花顺独家）"
             "\n- `get_northbound_flow(curr_date)`：获取北向资金流向（⚠️ 交易所自2024年起停止发布北向实时净买入数据，返回「已停止发布」提示+南向资金数据作为参考）"

@@ -33,7 +33,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_cashflow,
     get_income_statement,
     get_news,
-    get_insider_transactions,
+    get_company_events,
     get_global_news,
     get_profit_forecast,
     get_hot_stocks,
@@ -51,6 +51,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_homepage,
     get_stock_industry_peers,
     get_stock_holder,
+    get_stock_dividend,
     get_stock_equity_history,
     get_stock_position,
     get_market_context,
@@ -61,6 +62,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_web_search,
     get_article_content,
     get_stock_news,
+    get_f10_news,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -346,6 +348,7 @@ class TradingAgentsGraph:
                     get_web_search,
                     get_article_content,
                     get_stock_news,
+                    get_f10_news,
                 ]
             ),
             "fundamentals": ToolNode(
@@ -359,8 +362,9 @@ class TradingAgentsGraph:
                     get_financial_quarterly,
                     get_stock_homepage,
                     get_stock_industry_peers,
-                    get_insider_transactions,
+                    get_company_events,
                     get_stock_holder,
+                    get_stock_dividend,
                     verify_stock_valuation,
                 ]
             ),
@@ -374,7 +378,7 @@ class TradingAgentsGraph:
                 [
                     get_stock_kline_full,
                     get_news,
-                    get_insider_transactions,
+                    get_company_events,
                     get_hot_stocks,
                     get_northbound_flow,
                     get_concept_blocks,
@@ -389,7 +393,7 @@ class TradingAgentsGraph:
             ),
             "lockup": ToolNode(
                 [
-                    get_insider_transactions,
+                    get_company_events,
                     get_news,
                     get_lockup_expiry,
                     get_stock_basic,

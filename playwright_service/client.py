@@ -31,7 +31,7 @@ DEFAULT_TIMEOUT = int(os.getenv("AKS_TIMEOUT", "30"))
 # Circuit breaker: after this many consecutive failures, short-circuit
 # all requests for CIRCUIT_COOLDOWN seconds to avoid multi-minute hangs
 # when the server is down.
-CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("AKS_CIRCUIT_THRESHOLD", "5"))
+CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("AKS_CIRCUIT_THRESHOLD", "8"))
 CIRCUIT_COOLDOWN = int(os.getenv("AKS_CIRCUIT_COOLDOWN", "60"))
 
 # Min interval between requests to playwright_service (seconds).
@@ -167,9 +167,9 @@ class PlaywrightClient:
         """同花顺F10同行业对标: 同行财务指标排名"""
         return self._get("/api/stock-industry-peers", {"code": code})
 
-    def market_overview(self) -> dict:
-        """主要大盘指数概览（快速参考）"""
-        return self._get("/api/market-overview")
+    def market_overview(self, timeout: int = None) -> dict:
+        """主要大盘指数概览（快速参考）。timeout 覆盖默认超时(大盘概览冷启动可 >30s)。"""
+        return self._get("/api/market-overview", timeout=timeout)
 
     def stock_kline_full(self, code: str, days: int = 120, fqt: int = None) -> dict:
         """个股增强K线: 含换手率/涨跌幅/振幅。
@@ -209,6 +209,22 @@ class PlaywrightClient:
     def company_events(self, code: str) -> dict:
         """公司大事 (同花顺F10): 重要事件+高管持股变动+股东持股变动+担保+违规"""
         return self._get("/api/company-events", {"code": code})
+
+    def stock_dividend(self, code: str, market: str = "", name: str = "") -> dict:
+        """分红融资 (同花顺F10 astockpc SPA): 分红方案历史+分红诊断+增发/配股/获配明细
+
+        market 留空时服务端按代码前缀自动推断（60/68→17, 90→18, 00/30→33, 20→34, 8/4→151）。
+        """
+        params = {"code": code}
+        if market:
+            params["market"] = market
+        if name:
+            params["name"] = name
+        return self._get("/api/stock-dividend", params)
+
+    def stock_news_f10(self, code: str, limit: int = 15) -> dict:
+        """新闻公告 (同花顺F10 news.html): 新闻列表+研报列表"""
+        return self._get("/api/stock-news-f10", {"code": code, "limit": limit})
 
     def industry_hotmap(self, level: str = "bk2", top_n: int = 20, ticker: str = "") -> dict:
         """大盘星图行业热力 (东财 stockhotmap): 全市场个股按行业聚合排名。

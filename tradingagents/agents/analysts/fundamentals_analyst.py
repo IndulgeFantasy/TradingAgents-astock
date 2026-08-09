@@ -7,10 +7,11 @@ from tradingagents.agents.utils.agent_utils import (
     get_fundamentals,
     get_income_statement,
     get_industry_comparison,
-    get_insider_transactions,
+    get_company_events,
     get_language_instruction,
     get_profit_forecast,
     get_stock_holder,
+    get_stock_dividend,
     get_stock_homepage,
     get_stock_industry_peers,
     verify_stock_valuation,
@@ -37,8 +38,9 @@ def create_fundamentals_analyst(llm):
             get_financial_quarterly,
             get_stock_homepage,
             get_stock_industry_peers,
-            get_insider_transactions,
+            get_company_events,
             get_stock_holder,
+            get_stock_dividend,
             verify_stock_valuation,
         ]
 
@@ -59,8 +61,9 @@ def create_fundamentals_analyst(llm):
             "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（东财约128个行业板块按当日涨跌幅降序排名，含最新价/涨跌额/涨跌幅/总市值/换手率/上涨下跌家数/领涨股及涨幅，用于估值对标和行业定位）"
             "\n- `get_financial_quarterly(ticker)`：获取最近4期财务数据（营收/净利润/扣非净利润同比增长率、ROE、毛利率、净利率、资产负债率、每股收益、每股经营现金流等）-- 必采用途：营收同比增长率、归母净利润同比增长率、ROE、资产负债率、经营现金流/净利润比"
             "\n- `get_stock_homepage(ticker)`：获取综合概要（PE动态/静态、PB、总市值、质押比例、大盘/小盘分类）-- 必采用途：PE(TTM)、PB、总市值、股权质押比例"
+            "\n- `get_stock_dividend(ticker)`：获取分红融资数据（分红方案历史(报告期/董事会/股东大会预案/实施公告/股权登记日/除息日/方案/分红总额/进度/股利支付率)+分红诊断+增发/配股/增发获配机构明细）-- 必采用途：分红历史与股利支付率、增发/配股融资历史"
             "\n- `get_stock_industry_peers(ticker)`：获取同行业公司财务指标对标（行业排名、同行每股收益/ROE/毛利率对比）"
-            "\n- `get_insider_transactions(ticker)`：获取公司大事（同花顺F10 event.html，含近期重要事件(财报披露/公告/融资融券/大宗交易/业绩预告/股东大会/分红/回购/股权质押/股东增减持)+高管持股变动+股东持股变动+担保明细+违规处理+机构调研），用于评估内部人交易和公司治理风险"
+            "\n- `get_company_events(ticker)`：获取公司大事（同花顺F10 event.html，含近期重要事件(财报披露/公告/融资融券/大宗交易/业绩预告/股东大会/分红/回购/股权质押/股东增减持)+高管持股变动+股东持股变动+担保明细+违规处理+机构调研），用于评估内部人交易和公司治理风险"
             "\n- `get_stock_holder(ticker)`：获取股东研究数据（10期股东人数时序含人均流通股/人均持股金额、5期前十大流通股东含变动比例、5期前十大股东、退出前十大股东、同业对比），用于评估筹码集中度和股东变动"
             "\n- `verify_stock_valuation(code)`：使用精确十进制（Decimal）验算PE/PB/ROE，避免LLM心算浮点误差。自动从同花顺F10取数后验算"
             "\n\n撰写详尽的基本面研究报告，给出具体数据支撑的分析结论（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总关键财务指标和估值水平。"

@@ -8,7 +8,7 @@ from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
     get_income_statement as get_yfinance_income_statement,
-    get_insider_transactions as get_yfinance_insider_transactions,
+    get_company_events as get_yfinance_company_events,
 )
 from .yfinance_news import get_news_yfinance, get_global_news_yfinance
 from .alpha_vantage import (
@@ -18,7 +18,7 @@ from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
     get_income_statement as get_alpha_vantage_income_statement,
-    get_insider_transactions as get_alpha_vantage_insider_transactions,
+    get_company_events as get_alpha_vantage_company_events,
     get_news as get_alpha_vantage_news,
     get_global_news as get_alpha_vantage_global_news,
 )
@@ -33,7 +33,7 @@ from .a_stock import (
     get_income_statement as get_astock_income_statement,
     get_news as get_astock_news,
     get_global_news as get_astock_global_news,
-    get_insider_transactions as get_astock_insider_transactions,
+    get_company_events as get_astock_company_events,
     get_profit_forecast as get_astock_profit_forecast,
     get_hot_stocks as get_astock_hot_stocks,
     get_northbound_flow as get_astock_northbound_flow,
@@ -77,7 +77,7 @@ TOOLS_CATEGORIES = {
         "tools": [
             "get_news",
             "get_global_news",
-            "get_insider_transactions",
+            "get_company_events",
         ]
     },
     "signal_data": {
@@ -150,10 +150,10 @@ VENDOR_METHODS = {
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
-    "get_insider_transactions": {
-        "a_stock": get_astock_insider_transactions,
-        "alpha_vantage": get_alpha_vantage_insider_transactions,
-        "yfinance": get_yfinance_insider_transactions,
+    "get_company_events": {
+        "a_stock": get_astock_company_events,
+        "alpha_vantage": get_alpha_vantage_company_events,
+        "yfinance": get_yfinance_company_events,
     },
     # signal_data (A-stock only, with optional playwright enrichment)
     "get_profit_forecast": {

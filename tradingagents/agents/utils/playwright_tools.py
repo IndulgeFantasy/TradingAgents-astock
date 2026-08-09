@@ -129,12 +129,133 @@ def get_stock_homepage(code: str) -> str:
             lines.append(f"总股本: {_fmt_num(ts, '.2f')}亿  流通A股: {_fmt_num(fs, '.2f')}亿" if fs is not None else f"总股本: {_fmt_num(ts, '.2f')}亿")
         pledge = d.get("pledge_shares")
         pledge_pct = d.get("pledge_ratio")
-        if pledge is not None:
-            pct_str = f" ({_fmt_num(pledge_pct, '.2f')}%)" if isinstance(pledge_pct, (int, float)) else ""
-            lines.append(f"质押: {_fmt_num(pledge, '.4f')}亿股{pct_str}")
+        if pledge is not None or pledge_pct is not None:
+            if pledge is not None:
+                pct_str = f" ({_fmt_num(pledge_pct, '.2f')}%)" if isinstance(pledge_pct, (int, float)) else ""
+                lines.append(f"质押: {_fmt_num(pledge, '.4f')}亿股{pct_str}")
+            else:
+                lines.append(f"质押比例: {_fmt_num(pledge_pct, '.2f')}%")
         return "\n".join(lines)
     except Exception as e:
         return f"[首页] 获取异常: {e}"
+
+
+@tool("get_stock_dividend")
+def get_stock_dividend(code: str) -> str:
+    """获取分红融资数据（分红方案历史+分红诊断+增发/配股/增发获配明细），数据源: 同花顺F10 (astockpc #/bonus)"""
+    try:
+        client = _get_client()
+        result = client.stock_dividend(code)
+        if not result.get("success"):
+            return f"[分红融资] {code}: {result.get('error', '')}"
+        data = result.get("data", {})
+        lines = [
+            f"# 分红融资: {code}",
+            f"# 数据源: 同花顺F10 (astockpc)",
+            f"# 获取时间: {_now()}",
+            "",
+        ]
+
+        # 1. 分红方案历史
+        prog = data.get("programme") or {}
+        if prog.get("status_code") == 0:
+            pdata = prog.get("data", {})
+            total_cash = pdata.get("total_cash_dividend") or pdata.get("stock_cash_dividend")
+            if total_cash:
+                try:
+                    lines.append(f"上市后累计派现: {float(total_cash) / 1e8:.2f}亿元")
+                except (TypeError, ValueError):
+                    lines.append(f"上市后累计派现: {total_cash}元")
+            page_result = pdata.get("page_result") or {}
+            items = page_result.get("data") or []
+            if items:
+                lines.append(f"\n## 分红方案历史 ({page_result.get('total', len(items))} 期，最新 {min(10, len(items))} 期)")
+                lines.append(f"  {'报告期':<12} {'方案':<24} {'登记日':<12} {'除息日':<12} {'总额(亿)':<10} {'支付率':<8} {'进度'}")
+                lines.append("  " + "-" * 96)
+                for it in items[:10]:
+                    date = (it.get("date") or "")[:10]
+                    plan = (it.get("dividend_plan") or "")[:22]
+                    reg = it.get("equity_registration_date") or "--"
+                    exd = it.get("ex_dividend_date") or "--"
+                    total = it.get("stock_dividend_total")
+                    try:
+                        total_yi = f"{float(total) / 1e8:.2f}" if total else "--"
+                    except (TypeError, ValueError):
+                        total_yi = "--"
+                    pay = it.get("payment_rate")
+                    try:
+                        pay_s = f"{float(pay) * 100:.1f}%" if pay else "--"
+                    except (TypeError, ValueError):
+                        pay_s = "--"
+                    progress = it.get("progress_name") or "--"
+                    lines.append(f"  {date:<12} {plan:<24} {reg:<12} {exd:<12} {total_yi:<10} {pay_s:<8} {progress}")
+
+        # 2. 分红诊断
+        labels = data.get("label") or {}
+        if labels.get("status_code") == 0 and labels.get("data"):
+            names = [str(x.get("name", "")) for x in labels["data"] if x.get("name")]
+            if names:
+                lines.append(f"\n## 分红诊断: {' / '.join(names)}")
+
+        # 3. 增发
+        add = data.get("additional") or {}
+        if add.get("status_code") == 0:
+            stats = add.get("data", {}).get("additional_statistics", {})
+            details = add.get("data", {}).get("additional_details", [])
+            if stats:
+                lines.append(
+                    f"\n## 增发概况: 共{stats.get('issue_num', '--')}次"
+                    f"(成功{stats.get('issue_success_num', '--')}次)"
+                )
+            if details:
+                latest = details[0]
+                lines.append(
+                    f"  最近一次: {latest.get('date') or '--'} | 发行价 {latest.get('price')}元"
+                    f" | 募资 {float(latest.get('total_cash') or 0) / 1e8:.2f}亿"
+                )
+
+        # 4. 配股
+        allot = data.get("allotment") or {}
+        if allot.get("status_code") == 0:
+            stats = allot.get("data", {}).get("allotment_statistics", {})
+            details = allot.get("data", {}).get("allotment_details", [])
+            if stats:
+                lines.append(
+                    f"\n## 配股概况: 共{stats.get('issue_num', '--')}次"
+                    f"(成功{stats.get('issue_success_num', '--')}次)"
+                )
+            if details:
+                latest = details[0]
+                lines.append(
+                    f"  最近一次: {latest.get('allotment_name') or latest.get('date') or '--'}"
+                    f" | 配售比例 {latest.get('allotment_ratio')}"
+                )
+
+        # 5. 增发获配机构
+        org = data.get("org_allocated_detail") or {}
+        if org.get("status_code") == 0:
+            od = org.get("data", {})
+            stats = od.get("allocated_statistics", {})
+            if stats.get("allocated_org_num"):
+                lines.append(
+                    f"\n## 增发获配机构: {stats.get('allocated_org_num')}家"
+                    f" | 发行价 {stats.get('allocated_price', {}).get('value', '--')}元"
+                )
+            detail = od.get("allocated_detail", {})
+            orgs = detail.get("data") or []
+            if orgs:
+                lines.append("  机构: " + "、".join(str(o.get("org_name", "")) for o in orgs[:5]))
+
+        # 6. 分红比率
+        ratio = data.get("dividend_ratio") or {}
+        if ratio.get("status_code") == 0:
+            rd = ratio.get("data", {})
+            if rd.get("divided_result"):
+                lines.append(f"\n## 近三年分红比率: {float(rd['divided_result']) * 100:.2f}%")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[分红融资] 获取异常: {e}"
 
 
 @tool("get_stock_industry_peers")
@@ -349,14 +470,14 @@ def get_market_context() -> str:
     """获取主要大盘指数概况（上证/沪深300/深证成指/创业板指/科创50/中证500/国证2000，含均线/MACD/换手率/近5日K线(开盘/收盘/最高/最低/涨跌幅/成交量/成交额/换手率)+两市成交额+涨跌家数+北向南向资金+融资余额+领涨板块）。无需参数。"""
     try:
         client = _get_client()
-        result = client.market_overview()
+        result = client.market_overview(timeout=120)
         if not result.get("success"):
             err = result.get("error", "")
             if "熔断" in err:
                 return f"[大盘数据] 获取失败: {err}"
             from time import sleep
             sleep(1)
-            result = client.market_overview()
+            result = client.market_overview(timeout=120)
         if not result.get("success"):
             details = result.get("details", [])
             if details:
@@ -842,6 +963,63 @@ def get_stock_news(
         return "\n".join(lines)
     except Exception as e:
         return f"[股市新闻] 获取异常: {e}"
+
+
+@tool("get_f10_news")
+def get_f10_news(
+    code: str,
+    limit: Annotated[int, "新闻返回条数，默认 15"] = 15,
+) -> str:
+    """获取个股新闻公告与机构研报（同花顺F10 news.html）。
+
+    返回:
+    1. 个股新闻列表（标题/日期/来源/作者/链接，来源含同花顺iNews等）
+    2. 机构研报列表（评级/研报标题/机构/报告日期）
+    用于补充 get_news 的个股新闻覆盖（F10 口径，含研报评级）。
+    """
+    try:
+        client = _get_client()
+        result = client.stock_news_f10(code, limit)
+        if not result.get("success"):
+            return f"[F10新闻] {code}: {result.get('error', '')}"
+        data = result.get("data", {})
+        lines = [
+            f"# F10 新闻公告: {code}",
+            f"# 数据源: 同花顺F10 (news.html)",
+            f"# 获取时间: {_now()}",
+            "",
+        ]
+        news = data.get("news") or []
+        if news:
+            lines.append(f"## 个股新闻 (共{data.get('total', '?')}条，显示{len(news)}条)")
+            for it in news:
+                title = it.get("title", "")
+                date = it.get("date", "")
+                source = it.get("source", "")
+                url = it.get("url", "")
+                date_str = f" ({date})" if date else ""
+                src_str = f" [{source}]" if source else ""
+                lines.append(f"### {title}{date_str}{src_str}")
+                if url:
+                    lines.append(f"  链接: {url}")
+            lines.append("")
+        research = data.get("research_reports") or []
+        if research:
+            lines.append(f"## 机构研报 ({len(research)} 条)")
+            lines.append(f"  {'评级':<6} {'研报标题':<44} {'机构':<16} {'日期'}")
+            lines.append("  " + "-" * 90)
+            for r in research:
+                lines.append(
+                    f"  {str(r.get('rating', ''))[:6]:<6} "
+                    f"{str(r.get('report', ''))[:44]:<44} "
+                    f"{str(r.get('institution', ''))[:16]:<16} "
+                    f"{r.get('date', '')}"
+                )
+        if not news and not research:
+            return f"[F10新闻] {code}: 无数据"
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[F10新闻] 获取异常: {e}"
 
 
 @tool("get_article_content")

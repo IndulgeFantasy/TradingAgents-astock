@@ -51,7 +51,7 @@ def test_get_news_routes_valid_six_digit_code(monkeypatch):
 
 
 @pytest.mark.unit
-def test_get_insider_transactions_rejects_non_code_ticker(monkeypatch):
+def test_get_company_events_rejects_non_code_ticker(monkeypatch):
     called = False
 
     def fake_route_to_vendor(*args, **kwargs):
@@ -61,7 +61,7 @@ def test_get_insider_transactions_rejects_non_code_ticker(monkeypatch):
 
     monkeypatch.setattr(news_data_tools, "route_to_vendor", fake_route_to_vendor)
 
-    result = news_data_tools.get_insider_transactions.invoke(
+    result = news_data_tools.get_company_events.invoke(
         {"ticker": "\u9492\u7535\u6c60"}
     )
 

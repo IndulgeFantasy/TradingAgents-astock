@@ -99,7 +99,7 @@ The original TradingAgents is an excellent multi-agent research framework, but i
 |------|----------------|------------|
 | 🏪 Market Analyst | K-line patterns, technical indicators, volume-price analysis | `get_stock_data`, `get_indicators` |
 | 💬 Sentiment Analyst | Social media sentiment, retail investor discussion heat | `get_news` |
-| 📰 News Analyst | Industry news, announcements, macro events | `get_news`, `get_global_news`, `get_insider_transactions` |
+| 📰 News Analyst | Industry news, announcements, macro events | `get_news`, `get_global_news`, `get_company_events` |
 | 📊 Fundamental Analyst | Financial statement triad, profitability, valuation | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement` |
 
 ### A-share Specific 3 Roles (New)
@@ -107,8 +107,8 @@ The original TradingAgents is an excellent multi-agent research framework, but i
 | Role | Responsibilities | Data Tools | Why It's Needed |
 |------|----------------|------------|-----------------|
 | 🏛️ Policy Analyst | Regulatory policy, industrial policy, window guidance | `get_news`, `get_global_news` | A-share is a policy-driven market, policy changes directly impact sector rotation |
-| 🔥 Hot Money Tracker | Dragon-Tiger lists, large order flow, main force capital dynamics | `get_stock_data`, `get_news`, `get_insider_transactions` | Hot money is the core force behind short-term A-share pricing |
-| 🔓 Lock-up Monitor | Restricted share unlocks, major shareholder reductions, equity pledges | `get_insider_transactions`, `get_news`, `get_fundamentals` | Lock-up expiration is a unique, major supply shock factor for A-shares |
+| 🔥 Hot Money Tracker | Dragon-Tiger lists, large order flow, main force capital dynamics | `get_stock_data`, `get_news`, `get_company_events` | Hot money is the core force behind short-term A-share pricing |
+| 🔓 Lock-up Monitor | Restricted share unlocks, major shareholder reductions, equity pledges | `get_company_events`, `get_news`, `get_fundamentals` | Lock-up expiration is a unique, major supply shock factor for A-shares |
 
 The reports from all 7 analysts will feed into subsequent Bull/Bear debates and three-way risk debates, ensuring A-share specific factors are integrated throughout the entire decision-making chain.
 ## Data Sources

@@ -398,7 +398,7 @@ def get_income_statement(
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
 
-def get_insider_transactions(
+def get_company_events(
     ticker: Annotated[str, "ticker symbol of the company"]
 ):
     """Get insider transactions data from yfinance."""

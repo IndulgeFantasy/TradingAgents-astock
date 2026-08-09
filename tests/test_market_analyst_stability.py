@@ -110,7 +110,7 @@ FAILURE_MARKERS = [
     ("server_error", ["HTTP 500", "Internal Server Error"]),
     ("tool_exception", ["获取异常"]),
     ("fetch_failed", ["获取失败"]),
-    ("empty_data", ["无数据", "数据不足"]),
+    ("empty_data", ["无数据", "数据不足", "未返回"]),
     ("indicator_error", ["Error calculating"]),
 ]
 

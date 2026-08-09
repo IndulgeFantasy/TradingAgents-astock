@@ -108,15 +108,15 @@
 | 🏪 市场分析师 | K 线形态、技术指标、量价分析、行业热力 | `get_stock_kline_full`, `get_indicators`, `get_market_context`, `get_stock_levels`, `get_chip_distribution`, `get_industry_hotmap`, `analyze_pattern` |
 | 💬 舆情分析师 | 社交媒体情绪、散户讨论热度、主力资金情绪 | `get_news`, `get_fund_flow`, `get_market_context`, `get_industry_hotmap` |
 | 📰 新闻分析师 | 行业新闻、公告、宏观事件 | `get_news`, `get_global_news` |
-| 📊 基本面分析师 | 财报三表、盈利能力、估值 | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement`, `get_profit_forecast`, `get_industry_comparison`, `get_financial_quarterly`, `get_stock_homepage`, `get_stock_industry_peers`, `get_insider_transactions`, `get_stock_holder`, `verify_stock_valuation` |
+| 📊 基本面分析师 | 财报三表、盈利能力、估值 | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement`, `get_profit_forecast`, `get_industry_comparison`, `get_financial_quarterly`, `get_stock_homepage`, `get_stock_industry_peers`, `get_company_events`, `get_stock_holder`, `verify_stock_valuation` |
 
 ### A 股特化 3 角色（新增）
 
 | 角色 | 职责 | 数据工具 | 为什么需要 |
 |------|------|---------|-----------|
 | 🏛️ 政策分析师 | 监管政策、产业政策、窗口指导 | `get_news`, `get_global_news` | A 股是政策市，政策变化直接影响板块轮动 |
-| 🔥 游资追踪师 | 龙虎榜、大单流向、主力资金动态、涨停梯队 | `get_stock_kline_full`, `get_news`, `get_insider_transactions`, `get_hot_stocks`, `get_northbound_flow`, `get_concept_blocks`, `get_fund_flow`, `get_dragon_tiger_board`, `get_industry_comparison`, `get_industry_hotmap`, `get_stock_position`, `get_stock_holder`, `get_limit_up_pool` | 游资是 A 股短线定价的核心力量 |
-| 🔓 解禁监控师 | 限售股解禁、大股东减持、股权质押 | `get_insider_transactions`, `get_news`, `get_lockup_expiry`, `get_stock_basic`, `get_stock_holder`, `get_stock_equity_history` | 解禁是 A 股特有的重大供给冲击因素 |
+| 🔥 游资追踪师 | 龙虎榜、大单流向、主力资金动态、涨停梯队 | `get_stock_kline_full`, `get_news`, `get_company_events`, `get_hot_stocks`, `get_northbound_flow`, `get_concept_blocks`, `get_fund_flow`, `get_dragon_tiger_board`, `get_industry_comparison`, `get_industry_hotmap`, `get_stock_position`, `get_stock_holder`, `get_limit_up_pool` | 游资是 A 股短线定价的核心力量 |
+| 🔓 解禁监控师 | 限售股解禁、大股东减持、股权质押 | `get_company_events`, `get_news`, `get_lockup_expiry`, `get_stock_basic`, `get_stock_holder`, `get_stock_equity_history` | 解禁是 A 股特有的重大供给冲击因素 |
 
 所有 7 个 Analyst 的报告会流入后续的 Bull/Bear 辩论和三方风险辩论，确保 A 股特色因素贯穿整条决策链。
 

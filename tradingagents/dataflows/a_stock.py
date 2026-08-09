@@ -1391,10 +1391,10 @@ def get_global_news(
     )
 
 
-# ---- 9. get_insider_transactions ----
+# ---- 9. get_company_events ----
 
 
-def get_insider_transactions(
+def get_company_events(
     ticker: Annotated[str, "A-stock code"],
 ) -> str:
     """Get company events (重要事件+高管持股变动+股东持股变动+担保+违规) via 同花顺F10 event.html."""

@@ -98,6 +98,18 @@ _INDEX_CODES = {"000001", "000010", "000016", "000300", "000688", "000852",
 
 _cache = {}
 
+# ── SWR 缓存控制 ──
+# 缓存条目结构: {"ts", "data", "fresh_until", "hard_until", "is_error"}
+#   fresh_until 前        → fresh, 直接返回
+#   fresh_until..hard     → stale, 返回旧数据 + 后台刷新(请求零等待)
+#   hard_until 后         → miss, single-flight 合并并发冷调用
+# 失败结果也缓存(负缓存, _FAIL_CACHE_TTL 秒), 避免失败风暴反复打 Chrome
+_HARD_TTL_FACTOR = float(os.getenv("AKD_HARD_TTL_FACTOR", "6"))
+_FAIL_CACHE_TTL = float(os.getenv("AKD_FAIL_CACHE_TTL", "15"))
+_cache_lock = threading.Lock()    # 保护 _cache / _refresh_workers / _single_flight
+_refresh_workers = set()          # 后台刷新单飞行: key 集合
+_single_flight = {}               # key -> {"event": threading.Event, "data": result}
+
 # Chrome CDP 地址（playwright 通过 CDP 连接浏览器）
 _WENCAI_CDP = os.getenv("WENCAI_CDP", "http://127.0.0.1:9222")
 
@@ -188,27 +200,119 @@ async def _fetch_wencai_page(page, code):
     return results
 
 
-# ── 缓存装饰器 ──
+# ── 缓存装饰器 (SWR: stale-while-revalidate + single-flight + 负缓存) ──
 def _cache_key(func_name, args, kwargs):
     """Build cache key matching @cached decorator."""
     return f"{func_name}:{args}:{ {k: v for k, v in kwargs.items() if v is not None} }"
 
 
-def _cache_lookup(func, args=(), kwargs=None):
-    """Check cache without calling func or acquiring _cdp_lock.
-    Returns (hit: bool, data). Cache hits bypass _cdp_lock entirely."""
+def _store_cache(key, result, ttl, is_error=False):
+    """写缓存条目(线程安全)。失败结果也缓存(负缓存, 短 TTL)。"""
+    now = time.time()
+    if is_error:
+        fresh_until = now + _FAIL_CACHE_TTL
+        entry = {"ts": now, "data": result, "is_error": True,
+                 "fresh_until": fresh_until, "hard_until": fresh_until}
+    else:
+        hard_until = now + max(ttl * _HARD_TTL_FACTOR, ttl + 300)
+        entry = {"ts": now, "data": result, "is_error": False,
+                 "fresh_until": now + ttl, "hard_until": hard_until}
+    with _cache_lock:
+        _cache[key] = entry
+
+
+def _cache_status(func, args=(), kwargs=None):
+    """缓存状态检查(线程安全)。Returns (status, data), status ∈ fresh/stale/miss."""
     kwargs = kwargs or {}
     ttl = getattr(func, '_cached_ttl', 0)
     if ttl <= 0:
-        return False, None
+        return "miss", None
     key = _cache_key(func.__name__, args, kwargs)
     now = time.time()
-    entry = _cache.get(key)
-    if entry:
-        ts, data = entry
-        if now - ts < ttl:
-            return True, data
-    return False, None
+    with _cache_lock:
+        entry = _cache.get(key)
+    if not entry:
+        return "miss", None
+    if now < entry["fresh_until"]:
+        return "fresh", entry["data"]
+    if now < entry["hard_until"]:
+        return "stale", entry["data"]
+    return "miss", None
+
+
+def _refresh_in_background(key, func, args, kwargs, ttl):
+    """stale 后台刷新(每 key 单飞行): 拿 _cdp_lock 执行原始函数并回写缓存。
+
+    请求线程不等待刷新结果, 直接返回旧数据; 刷新与前台 Chrome 操作互斥。
+    """
+    with _cache_lock:
+        if key in _refresh_workers:
+            return
+        _refresh_workers.add(key)
+
+    def worker():
+        try:
+            with _cdp_lock:
+                raw = getattr(func, "__wrapped__", func)
+                result = raw(*args, **kwargs)
+            ok = isinstance(result, dict) and result.get("success")
+            _store_cache(key, result, ttl, is_error=not ok)
+        except Exception as e:
+            _store_cache(key, {"success": False,
+                               "error": f"{type(e).__name__}: {str(e)[:200]}"},
+                         ttl, is_error=True)
+        finally:
+            with _cache_lock:
+                _refresh_workers.discard(key)
+
+    threading.Thread(target=worker, daemon=True,
+                     name=f"swr-refresh-{key[:40]}").start()
+
+
+def _single_flight_fetch(func, args, kwargs, ttl):
+    """缓存 miss 的并发合并(必须在 _cdp_lock 之外调用)。
+
+    leader 持锁执行原始函数, followers 等待 leader 结果复用 ——
+    并发雪崩(N 个 miss 排队冷调用)收敛为 1 次冷调用 + N-1 个等待者。
+    """
+    key = _cache_key(func.__name__, args, kwargs)
+    with _cache_lock:
+        is_leader = key not in _single_flight
+        if is_leader:
+            waiter = _single_flight[key] = {"event": threading.Event(), "data": None}
+        else:
+            waiter = _single_flight[key]
+    if not is_leader:
+        waiter["event"].wait(timeout=120)
+        return waiter["data"]
+    try:
+        with _cdp_lock:
+            raw = getattr(func, "__wrapped__", func)
+            result = raw(*args, **kwargs)
+        ok = isinstance(result, dict) and result.get("success")
+        _store_cache(key, result, ttl, is_error=not ok)
+        waiter["data"] = result
+    except Exception as e:
+        result = {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        waiter["data"] = result
+    finally:
+        waiter["event"].set()
+        with _cache_lock:
+            _single_flight.pop(key, None)
+    return waiter["data"]
+
+
+def _serve_cached(func, args, kwargs):
+    """统一缓存服务入口: fresh → 直返; stale → 锁内 wrapper(启动刷新, 零等待);
+    miss → single-flight 合并并发冷调用。"""
+    status, cached_data = _cache_status(func, args, kwargs)
+    if status == "fresh":
+        return cached_data
+    ttl = getattr(func, "_cached_ttl", 0) or CACHE_TTL
+    if status == "stale":
+        with _cdp_lock:
+            return func(*args, **kwargs)
+    return _single_flight_fetch(func, args, kwargs, ttl)
 
 
 def cached(ttl=None):
@@ -220,13 +324,18 @@ def cached(ttl=None):
                 return func(*args, **kwargs)
             key = _cache_key(func.__name__, args, kwargs)
             now = time.time()
-            if key in _cache:
-                ts, data = _cache[key]
-                if now - ts < ttl:
-                    return data
+            with _cache_lock:
+                entry = _cache.get(key)
+            if entry and now < entry["fresh_until"]:
+                return entry["data"]
+            if entry and now < entry["hard_until"]:
+                # SWR: 返回旧数据 + 后台刷新(单飞行), 请求零等待
+                _refresh_in_background(key, func, args, kwargs, ttl)
+                return entry["data"]
+            # miss/hard-expired: 当前线程执行(调用方持锁或走 single-flight)
             result = func(*args, **kwargs)
-            if isinstance(result, dict) and result.get("success"):
-                _cache[key] = (now, result)
+            ok = isinstance(result, dict) and result.get("success")
+            _store_cache(key, result, ttl, is_error=not ok)
             return result
         wrapper._cached_ttl = ttl
         return wrapper
@@ -403,6 +512,300 @@ def fetch_stock_basic(code: str):
 
 
 # ── fetch_market_overview: 大盘概览（东财 zs 页面）──
+async def _fetch_index_page(ctx, idx, code, name, extra):
+    """并行抓取单个指数页（fetch_market_overview 的单元）。
+
+    每个指数用独立 page；extra 仅由 idx==0 页写入（单写者，无需锁）。
+    返回 (name, result_entry|None, errors:list)。
+    """
+    secid = f"1.{code}" if code.startswith(("0", "6")) else f"0.{code}"
+    url = f"https://quote.eastmoney.com/zs{code}.html"
+    captured = {"kline_list": [], "price": None}
+    errors = []
+
+    async def on_response(resp):
+        url_match = resp.url
+        try:
+            import re, json
+            body = await resp.text()
+            body = re.sub(r'^\w+\(|\)[^)]*$', '', body)
+            d = json.loads(body)
+
+            # push2 实时行情
+            if "api/qt/stock/get" in url_match and "kline" not in url_match and "ulist" not in url_match:
+                data = d.get("data", {})
+                if data:
+                    captured["price"] = data.get("f43", 0) / 100 if data.get("f43") else None
+
+            # K 线历史 — 用列表收集所有 kline 响应，取第一个有效结果
+            # (东财指数页面可能同时请求多个 kline API，后到的会覆盖先到的)
+            if "api/qt/stock/kline/get" in url_match and "smplmt" not in url_match:
+                klines_raw = d.get("data", {}).get("klines", [])
+                if klines_raw:
+                    parsed = []
+                    for k in klines_raw:
+                        parts = k.split(",")
+                        if len(parts) >= 6:
+                            try:
+                                entry = {
+                                    "date": parts[0],
+                                    "open": float(parts[1]),
+                                    "close": float(parts[2]),
+                                    "high": float(parts[3]),
+                                    "low": float(parts[4]),
+                                    "volume": float(parts[5]),
+                                }
+                                if len(parts) >= 7:
+                                    entry["amount"] = float(parts[6])
+                                if len(parts) >= 9:
+                                    entry["pctChg"] = float(parts[8])
+                                if len(parts) >= 11:
+                                    entry["turnover"] = float(parts[10])
+                                parsed.append(entry)
+                            except (ValueError, IndexError):
+                                pass
+                    if len(parsed) >= 2:
+                        captured["kline_list"].append(parsed)
+
+            # 互联互通资金流向 (北向+南向，只在第一次加载时捕获)
+            if idx == 0 and "api/qt/kamt/get" in url_match:
+                data = d.get("data", {})
+                # 北向净买入: hk2sh(沪股通) hk2sz(深股通) — 外资买A股净额(万元)
+                # 注意: 2024-08-16 起交易所停止发布北向实时净买入，netBuyAmt
+                #       恒为 0 或字段缺失；上游任何非零值都只是占位/旧快照。
+                #       因此无条件标记不可用，禁止把净买入数值泄漏给 LLM。
+                extra["north_net_sh"] = None
+                extra["north_net_sz"] = None
+                extra["north_unavailable"] = True
+                # 北向成交额: hk2sh(沪) hk2sz(深) — 外资在A股总成交额(万元)
+                hk_bs_sh_raw = data.get("hk2sh", {}).get("buySellAmt", 0)
+                hk_bs_sz_raw = data.get("hk2sz", {}).get("buySellAmt", 0)
+                extra["hk_bs_sh"] = round(hk_bs_sh_raw / 10000, 2) if hk_bs_sh_raw else None
+                extra["hk_bs_sz"] = round(hk_bs_sz_raw / 10000, 2) if hk_bs_sz_raw else None
+                # 南向净买入: sh2hk(沪港通) sz2hk(深港通) — 内资买港股净额(万元)
+                sh_net = data.get("sh2hk", {}).get("netBuyAmt", 0)
+                sz_net = data.get("sz2hk", {}).get("netBuyAmt", 0)
+                extra["hk_net_sh"] = round(sh_net / 10000, 2) if sh_net else None
+                extra["hk_net_sz"] = round(sz_net / 10000, 2) if sz_net else None
+                # 南向成交额: sh2hk(沪) sz2hk(深) — 内资买港股总成交额(万元)
+                ss_bs_sh = data.get("sh2hk", {}).get("buySellAmt", 0)
+                ss_bs_sz = data.get("sz2hk", {}).get("buySellAmt", 0)
+                extra["hk_bs_ss_sh"] = round(ss_bs_sh / 10000, 2) if ss_bs_sh else None
+                extra["hk_bs_ss_sz"] = round(ss_bs_sz / 10000, 2) if ss_bs_sz else None
+
+            # 行业板块排行 (只在第一次加载时捕获)
+            if idx == 0 and "api/qt/clist/get" in url_match and "t:2" in url_match:
+                items = d.get("data", {}).get("diff", [])
+                if items and len(items) >= 3:
+                    top5 = []
+                    for item in items[:5]:
+                        top5.append({
+                            "name": item.get("f14", ""),
+                            "chg": item.get("f3", 0),
+                        })
+                    if top5 and not extra["top_sectors"]:
+                        extra["top_sectors"] = top5
+
+            # 融资融券 (只在第一次加载时捕获，且只取第一次有效值)
+            if idx == 0 and "RPT_MARGIN" in url_match:
+                items = d.get("result", {}).get("data", [])
+                if items and extra["margin_balance"] is None:
+                    extra["margin_balance"] = items[0].get("MARGIN_BALANCE", 0)
+
+        except Exception:
+            pass
+
+    page = await ctx.new_page()
+    await page.set_viewport_size({"width": 1280, "height": 800})
+    page.on("response", on_response)
+
+    entry = None
+    try:
+        async with page.expect_response(
+            lambda r, s=secid: f"secid={s}" in r.url and "kline" in r.url,
+            timeout=15000
+        ) as resp_info:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        # 信号等待: 已捕获到K线后留约 0.5s 让多套K线响应到齐
+        await _wait_for_ready(
+            page,
+            lambda: bool(captured["kline_list"]),
+            timeout=8.0,
+            poll_ms=200,
+        )
+
+        # 东财指数页面可能返回多套 K 线（长期日K + 短期日K），
+        # 取最后捕获的那个（通常是页面主图的日K，长度 60-120）
+        klines = captured["kline_list"][-1] if captured["kline_list"] else []
+
+        if klines and len(klines) >= 62:
+            last = klines[-1]
+            sixtieth = klines[-60]
+            close_now = last["close"]
+            close_prev = klines[-2]["close"]
+            close_60d_ago = sixtieth["close"]
+
+            pct_chg = round((close_now - close_prev) / close_prev * 100, 4)
+            chg_60d = round((close_now - close_60d_ago) / close_60d_ago * 100, 4) if close_60d_ago else None
+            entry = {
+                "最新": close_now,
+                "涨跌幅": pct_chg,
+                "近60日涨跌幅": chg_60d,
+            }
+
+            # 所有指数: 均线 + 量价 + 近5日K线摘要
+            if len(klines) >= 60:
+                closes = [k["close"] for k in klines]
+                vols = [k.get("volume", 0) for k in klines]
+                turnovers = [k.get("turnover", 0) for k in klines if k.get("turnover")]
+                ma5 = sum(closes[-5:]) / 5
+                ma10 = sum(closes[-10:]) / 10
+                ma20 = sum(closes[-20:]) / 20
+                ma60 = sum(closes[-60:]) / 60
+                vol_now = vols[-1]
+                vol_ma5 = sum(vols[-5:]) / 5
+                # 多空排列判断
+                bull = ma5 > ma10 > ma20 > ma60
+                bear = ma5 < ma10 < ma20 < ma60
+                # 量价关系
+                if close_now > ma5 and vol_now > vol_ma5 * 1.3:
+                    vol_price = "放量上涨"
+                elif close_now < ma5 and vol_now > vol_ma5 * 1.3:
+                    vol_price = "放量下跌"
+                elif close_now > ma5 and vol_now < vol_ma5 * 0.7:
+                    vol_price = "缩量上涨"
+                elif close_now < ma5 and vol_now < vol_ma5 * 0.7:
+                    vol_price = "缩量下跌"
+                else:
+                    vol_price = "正常"
+                entry["均线"] = {
+                    "MA5": round(ma5, 2),
+                    "MA10": round(ma10, 2),
+                    "MA20": round(ma20, 2),
+                    "MA60": round(ma60, 2),
+                    "排列": "多头" if bull else ("空头" if bear else "震荡"),
+                }
+                entry["量价"] = vol_price
+                entry["成交量"] = round(vol_now, 0)
+                if turnovers:
+                    entry["换手率"] = round(turnovers[-1], 2)
+                # MACD (12,26,9)
+                if len(closes) >= 35:
+                    ema12 = closes[0]
+                    for c in closes[1:]:
+                        ema12 = c * 2 / 13 + ema12 * 11 / 13
+                    ema26 = closes[0]
+                    for c in closes[1:]:
+                        ema26 = c * 2 / 27 + ema26 * 25 / 27
+                    dif = ema12 - ema26
+                    # DEA 是 DIF 的 9 日 EMA，简化用最近 9 日 DIF 序列
+                    difs = []
+                    ema12_r = closes[0]
+                    ema26_r = closes[0]
+                    for c in closes[1:]:
+                        ema12_r = c * 2 / 13 + ema12_r * 11 / 13
+                        ema26_r = c * 2 / 27 + ema26_r * 25 / 27
+                        difs.append(ema12_r - ema26_r)
+                    if len(difs) >= 9:
+                        dea = difs[-9]
+                        for d in difs[-8:]:
+                            dea = d * 2 / 10 + dea * 8 / 10
+                        macd = (dif - dea) * 2
+                        entry["MACD"] = {
+                            "DIF": round(dif, 2),
+                            "DEA": round(dea, 2),
+                            "MACD": round(macd, 2),
+                        }
+                # 近5日K线摘要
+                recent_5 = klines[-5:]
+                entry["近5日"] = [
+                    {
+                        "date": k.get("date", ""),
+                        "open": k.get("open", 0),
+                        "close": k["close"],
+                        "high": k.get("high", 0),
+                        "low": k.get("low", 0),
+                        "pctChg": k.get("pctChg", 0),
+                        "volume": k.get("volume", 0),
+                        "amount": k.get("amount", 0),
+                        "turnover": k.get("turnover", 0),
+                    }
+                    for k in recent_5
+                ]
+        else:
+            errors.append(f"{code}: 无K线数据")
+
+    except Exception as e:
+        errors.append(f"{code}: {type(e).__name__}: {str(e)[:60]}")
+
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+
+    # 首次加载完成后，从 DOM 提取额外数据（仅 idx==0；页面此刻仍打开）
+    if idx == 0:
+        try:
+            dom_data = await page.evaluate("""() => {
+                const result = { total_amount: null, up_count: null, down_count: null };
+                const text = document.body.innerText;
+                const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
+
+                // 两市成交额: 上证 + 深证
+                let counted = new Set();
+                let total = 0;
+                for (const l of lines) {
+                    for (const mkt of ['上证', '深证']) {
+                        if (l.includes(mkt) && !counted.has(mkt)) {
+                            const m = l.match(/([\\d.]+)(万亿|亿)/);
+                            if (m) {
+                                const val = parseFloat(m[1]);
+                                total += m[2] === '万亿' ? val * 10000 : val;
+                                counted.add(mkt);
+                            }
+                        }
+                    }
+                }
+                if (total > 0) result.total_amount = total;
+
+                // 涨跌家数
+                let totalUp = 0;
+                let totalDown = 0;
+                for (const l of lines) {
+                    const m = l.match(/涨:(\\d+)\\s*平:(\\d+)\\s*跌:(\\d+)/);
+                    if (m) {
+                        totalUp += parseInt(m[1]);
+                        totalDown += parseInt(m[3]);
+                    }
+                }
+                if (totalUp > 0) result.up_count = totalUp;
+                if (totalDown > 0) result.down_count = totalDown;
+
+                return result;
+            }""")
+            if dom_data.get("total_amount"):
+                extra["total_amount"] = dom_data["total_amount"]
+            if dom_data.get("up_count") is not None:
+                extra["up_count"] = dom_data["up_count"]
+            if dom_data.get("down_count") is not None:
+                extra["down_count"] = dom_data["down_count"]
+
+        except Exception as e:
+            import logging
+            logging.getLogger("playwright_service").warning(
+                "fetch_market_overview: DOM extra data extraction failed: %s", e
+            )
+
+    # 关闭页面，避免页面泄漏
+    try:
+        await page.close()
+    except Exception:
+        pass
+
+    return name, entry, errors
+
+
 @cached(ttl=600)
 def fetch_market_overview():
     import asyncio
@@ -437,307 +840,28 @@ def fetch_market_overview():
                          "hk_bs_ss_sh": None, "hk_bs_ss_sz": None,
                          "top_sectors": [], "margin_balance": None}
 
-                for idx, (code, name) in enumerate(indices):
-                    secid = f"1.{code}" if code.startswith(("0", "6")) else f"0.{code}"
-                    url = f"https://quote.eastmoney.com/zs{code}.html"
-                    captured = {"kline_list": [], "price": None}
-                    # 每个指数用独立 page，避免 TargetClosedError
-                    page = await ctx.new_page()
-                    await page.set_viewport_size({"width": 1280, "height": 800})
+                # 并行抓取 7 个指数页（各自独立 page）。串行最坏 ~78s，
+                # 并行实测 ~20s，低于客户端默认 30s 超时。extra 仅由 idx==0
+                # 页写入（单写者），errors 由各 task 返回后合并。
+                tasks = [
+                    asyncio.create_task(_fetch_index_page(ctx, idx, code, name, extra))
+                    for idx, (code, name) in enumerate(indices)
+                ]
+                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    async def on_response(resp, idx=idx):
-                        url_match = resp.url
-                        try:
-                            import re, json
-                            body = await resp.text()
-                            body = re.sub(r'^\w+\(|\)[^)]*$', '', body)
-                            d = json.loads(body)
-
-                            # push2 实时行情
-                            if "api/qt/stock/get" in url_match and "kline" not in url_match and "ulist" not in url_match:
-                                data = d.get("data", {})
-                                if data:
-                                    captured["price"] = data.get("f43", 0) / 100 if data.get("f43") else None
-
-                            # K 线历史 — 用列表收集所有 kline 响应，取第一个有效结果
-                            # (东财指数页面可能同时请求多个 kline API，后到的会覆盖先到的)
-                            if "api/qt/stock/kline/get" in url_match and "smplmt" not in url_match:
-                                klines_raw = d.get("data", {}).get("klines", [])
-                                if klines_raw:
-                                    parsed = []
-                                    for k in klines_raw:
-                                        parts = k.split(",")
-                                        if len(parts) >= 6:
-                                            try:
-                                                entry = {
-                                                    "date": parts[0],
-                                                    "open": float(parts[1]),
-                                                    "close": float(parts[2]),
-                                                    "high": float(parts[3]),
-                                                    "low": float(parts[4]),
-                                                    "volume": float(parts[5]),
-                                                }
-                                                if len(parts) >= 7:
-                                                    entry["amount"] = float(parts[6])
-                                                if len(parts) >= 9:
-                                                    entry["pctChg"] = float(parts[8])
-                                                if len(parts) >= 11:
-                                                    entry["turnover"] = float(parts[10])
-                                                parsed.append(entry)
-                                            except (ValueError, IndexError):
-                                                pass
-                                    if len(parsed) >= 2:
-                                        captured["kline_list"].append(parsed)
-
-                            # 互联互通资金流向 (北向+南向，只在第一次加载时捕获)
-                            if idx == 0 and "api/qt/kamt/get" in url_match:
-                                data = d.get("data", {})
-                                # 北向净买入: hk2sh(沪股通) hk2sz(深股通) — 外资买A股净额(万元)
-                                # 注意: 2024年起交易所停止发布北向实时净买入，netBuyAmt 始终为0
-                                #       当 netBuyAmt==0 且 buySellAmt>0 时，标注为"已停止发布"
-                                nb_sh_raw = data.get("hk2sh", {}).get("netBuyAmt", 0)
-                                nb_sz_raw = data.get("hk2sz", {}).get("netBuyAmt", 0)
-                                hk_bs_sh_raw = data.get("hk2sh", {}).get("buySellAmt", 0)
-                                hk_bs_sz_raw = data.get("hk2sz", {}).get("buySellAmt", 0)
-                                north_unavailable = (nb_sh_raw == 0 and hk_bs_sh_raw > 0)
-                                if north_unavailable:
-                                    extra["north_net_sh"] = None
-                                    extra["north_net_sz"] = None
-                                    extra["north_unavailable"] = True
-                                else:
-                                    extra["north_net_sh"] = round(nb_sh_raw / 10000, 2) if nb_sh_raw else None
-                                    extra["north_net_sz"] = round(nb_sz_raw / 10000, 2) if nb_sz_raw else None
-                                    extra["north_unavailable"] = False
-                                # 北向成交额: hk2sh(沪) hk2sz(深) — 外资在A股总成交额(万元)
-                                extra["hk_bs_sh"] = round(hk_bs_sh_raw / 10000, 2) if hk_bs_sh_raw else None
-                                extra["hk_bs_sz"] = round(hk_bs_sz_raw / 10000, 2) if hk_bs_sz_raw else None
-                                # 南向净买入: sh2hk(沪港通) sz2hk(深港通) — 内资买港股净额(万元)
-                                sh_net = data.get("sh2hk", {}).get("netBuyAmt", 0)
-                                sz_net = data.get("sz2hk", {}).get("netBuyAmt", 0)
-                                extra["hk_net_sh"] = round(sh_net / 10000, 2) if sh_net else None
-                                extra["hk_net_sz"] = round(sz_net / 10000, 2) if sz_net else None
-                                # 南向成交额: sh2hk(沪) sz2hk(深) — 内资买港股总成交额(万元)
-                                ss_bs_sh = data.get("sh2hk", {}).get("buySellAmt", 0)
-                                ss_bs_sz = data.get("sz2hk", {}).get("buySellAmt", 0)
-                                extra["hk_bs_ss_sh"] = round(ss_bs_sh / 10000, 2) if ss_bs_sh else None
-                                extra["hk_bs_ss_sz"] = round(ss_bs_sz / 10000, 2) if ss_bs_sz else None
-
-                            # 行业板块排行 (只在第一次加载时捕获)
-                            if idx == 0 and "api/qt/clist/get" in url_match and "t:2" in url_match:
-                                items = d.get("data", {}).get("diff", [])
-                                if items and len(items) >= 3:
-                                    top5 = []
-                                    for item in items[:5]:
-                                        top5.append({
-                                            "name": item.get("f14", ""),
-                                            "chg": item.get("f3", 0),
-                                        })
-                                    if top5 and not extra["top_sectors"]:
-                                        extra["top_sectors"] = top5
-
-                            # 融资融券 (只在第一次加载时捕获，且只取第一次有效值)
-                            if idx == 0 and "RPT_MARGIN" in url_match:
-                                items = d.get("result", {}).get("data", [])
-                                if items and extra["margin_balance"] is None:
-                                    extra["margin_balance"] = items[0].get("MARGIN_BALANCE", 0)
-
-                        except Exception:
-                            pass
-
-                    page.on("response", on_response)
-
-                    try:
-                        async with page.expect_response(
-                            lambda r, s=secid: f"secid={s}" in r.url and "kline" in r.url,
-                            timeout=15000
-                        ) as resp_info:
-                            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                        # 信号等待: 已捕获到K线后留约 0.5s 让多套K线响应到齐
-                        await _wait_for_ready(
-                            page,
-                            lambda: bool(captured["kline_list"]),
-                            timeout=8.0,
-                            poll_ms=200,
+                for outcome in outcomes:
+                    if isinstance(outcome, Exception):
+                        errors.append(
+                            f"并行抓取异常: {type(outcome).__name__}: {str(outcome)[:80]}"
                         )
+                        continue
+                    name, entry, page_errors = outcome
+                    errors.extend(page_errors)
+                    if entry is not None:
+                        results[name] = entry
 
-                        # 东财指数页面可能返回多套 K 线（长期日K + 短期日K），
-                        # 取最后捕获的那个（通常是页面主图的日K，长度 60-120）
-                        klines = captured["kline_list"][-1] if captured["kline_list"] else []
-
-                        if klines and len(klines) >= 62:
-                            last = klines[-1]
-                            sixtieth = klines[-60]
-                            close_now = last["close"]
-                            close_prev = klines[-2]["close"]
-                            close_60d_ago = sixtieth["close"]
-
-                            pct_chg = round((close_now - close_prev) / close_prev * 100, 4)
-                            chg_60d = round((close_now - close_60d_ago) / close_60d_ago * 100, 4) if close_60d_ago else None
-                            results[name] = {
-                                "最新": close_now,
-                                "涨跌幅": pct_chg,
-                                "近60日涨跌幅": chg_60d,
-                            }
-
-                            # 所有指数: 均线 + 量价 + 近5日K线摘要
-                            if len(klines) >= 60:
-                                closes = [k["close"] for k in klines]
-                                vols = [k.get("volume", 0) for k in klines]
-                                turnovers = [k.get("turnover", 0) for k in klines if k.get("turnover")]
-                                ma5 = sum(closes[-5:]) / 5
-                                ma10 = sum(closes[-10:]) / 10
-                                ma20 = sum(closes[-20:]) / 20
-                                ma60 = sum(closes[-60:]) / 60
-                                vol_now = vols[-1]
-                                vol_ma5 = sum(vols[-5:]) / 5
-                                # 多空排列判断
-                                bull = ma5 > ma10 > ma20 > ma60
-                                bear = ma5 < ma10 < ma20 < ma60
-                                # 量价关系
-                                if close_now > ma5 and vol_now > vol_ma5 * 1.3:
-                                    vol_price = "放量上涨"
-                                elif close_now < ma5 and vol_now > vol_ma5 * 1.3:
-                                    vol_price = "放量下跌"
-                                elif close_now > ma5 and vol_now < vol_ma5 * 0.7:
-                                    vol_price = "缩量上涨"
-                                elif close_now < ma5 and vol_now < vol_ma5 * 0.7:
-                                    vol_price = "缩量下跌"
-                                else:
-                                    vol_price = "正常"
-                                results[name]["均线"] = {
-                                    "MA5": round(ma5, 2),
-                                    "MA10": round(ma10, 2),
-                                    "MA20": round(ma20, 2),
-                                    "MA60": round(ma60, 2),
-                                    "排列": "多头" if bull else ("空头" if bear else "震荡"),
-                                }
-                                results[name]["量价"] = vol_price
-                                results[name]["成交量"] = round(vol_now, 0)
-                                if turnovers:
-                                    results[name]["换手率"] = round(turnovers[-1], 2)
-                                # MACD (12,26,9)
-                                if len(closes) >= 35:
-                                    ema12 = closes[0]
-                                    for c in closes[1:]:
-                                        ema12 = c * 2 / 13 + ema12 * 11 / 13
-                                    ema26 = closes[0]
-                                    for c in closes[1:]:
-                                        ema26 = c * 2 / 27 + ema26 * 25 / 27
-                                    dif = ema12 - ema26
-                                    # DEA 是 DIF 的 9 日 EMA，简化用最近 9 日 DIF 序列
-                                    difs = []
-                                    ema12_r = closes[0]
-                                    ema26_r = closes[0]
-                                    for c in closes[1:]:
-                                        ema12_r = c * 2 / 13 + ema12_r * 11 / 13
-                                        ema26_r = c * 2 / 27 + ema26_r * 25 / 27
-                                        difs.append(ema12_r - ema26_r)
-                                    if len(difs) >= 9:
-                                        dea = difs[-9]
-                                        for d in difs[-8:]:
-                                            dea = d * 2 / 10 + dea * 8 / 10
-                                        macd = (dif - dea) * 2
-                                        results[name]["MACD"] = {
-                                            "DIF": round(dif, 2),
-                                            "DEA": round(dea, 2),
-                                            "MACD": round(macd, 2),
-                                        }
-                                # 近5日K线摘要
-                                recent_5 = klines[-5:]
-                                results[name]["近5日"] = [
-                                    {
-                                        "date": k.get("date", ""),
-                                        "open": k.get("open", 0),
-                                        "close": k["close"],
-                                        "high": k.get("high", 0),
-                                        "low": k.get("low", 0),
-                                        "pctChg": k.get("pctChg", 0),
-                                        "volume": k.get("volume", 0),
-                                        "amount": k.get("amount", 0),
-                                        "turnover": k.get("turnover", 0),
-                                    }
-                                    for k in recent_5
-                                ]
-                        else:
-                            errors.append(f"{code}: 无K线数据")
-
-                    except Exception as e:
-                        errors.append(f"{code}: {type(e).__name__}: {str(e)[:60]}")
-
-                    finally:
-                        try:
-                            page.remove_listener("response", on_response)
-                        except Exception:
-                            pass
-                        # 每个指数用独立 page，处理完后关闭
-                        if idx > 0:
-                            try:
-                                await page.close()
-                            except Exception:
-                                pass
-
-                    # 首次加载完成后，从 DOM 提取额外数据
-                    if idx == 0:
-                        try:
-                            dom_data = await page.evaluate("""() => {
-                                const result = { total_amount: null, up_count: null, down_count: null };
-                                const text = document.body.innerText;
-                                const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
-
-                                // 两市成交额: 上证 + 深证
-                                let counted = new Set();
-                                let total = 0;
-                                for (const l of lines) {
-                                    for (const mkt of ['上证', '深证']) {
-                                        if (l.includes(mkt) && !counted.has(mkt)) {
-                                            const m = l.match(/([\\d.]+)(万亿|亿)/);
-                                            if (m) {
-                                                const val = parseFloat(m[1]);
-                                                total += m[2] === '万亿' ? val * 10000 : val;
-                                                counted.add(mkt);
-                                            }
-                                        }
-                                    }
-                                }
-                                if (total > 0) result.total_amount = total;
-
-                                // 涨跌家数
-                                let totalUp = 0;
-                                let totalDown = 0;
-                                for (const l of lines) {
-                                    const m = l.match(/涨:(\\d+)\\s*平:(\\d+)\\s*跌:(\\d+)/);
-                                    if (m) {
-                                        totalUp += parseInt(m[1]);
-                                        totalDown += parseInt(m[3]);
-                                    }
-                                }
-                                if (totalUp > 0) result.up_count = totalUp;
-                                if (totalDown > 0) result.down_count = totalDown;
-
-                                return result;
-                            }""")
-                            if dom_data.get("total_amount"):
-                                extra["total_amount"] = dom_data["total_amount"]
-                            if dom_data.get("up_count") is not None:
-                                extra["up_count"] = dom_data["up_count"]
-                            if dom_data.get("down_count") is not None:
-                                extra["down_count"] = dom_data["down_count"]
-
-                        except Exception as e:
-                            import logging
-                            logging.getLogger("playwright_service").warning(
-                                "fetch_market_overview: DOM extra data extraction failed: %s", e
-                            )
-
-                    # 关闭当前页面，避免循环内页面泄漏
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                    # 循环间隔: 让 Chrome CDP 回收资源，避免连续开关页面过快
-                    if idx < len(indices) - 1:
-                        import random
-                        await asyncio.sleep(1.5 + random.random() * 0.5)
+                # 并行创建页面后统一让 Chrome CDP 喘息一次，避免连续开关页面过快
+                await asyncio.sleep(1.5)
 
                 if not results:
                     return {"success": False, "error": "获取大盘数据失败", "details": errors}
@@ -802,10 +926,8 @@ def fetch_market_overview():
                 return ret
 
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                # 页面已在各 _fetch_index_page task 内关闭，无需在此处理
+                pass
 
     try:
         return asyncio.run(_do_query())
@@ -1073,7 +1195,7 @@ def fetch_stock_homepage(code: str):
                             for (let i = 0; i < cells.length - 1; i++) {
                                 const label = cells[i].textContent.trim();
                                 const val = cells[i+1].textContent.trim();
-                                if (label && val && !pairs[label]) pairs[label] = val;
+                                if (label && val && val.length < 60 && !pairs[label]) pairs[label] = val;
                             }
                         }
                     }
@@ -1088,12 +1210,18 @@ def fetch_stock_homepage(code: str):
 
                 # PE(动态), PE(静态), PB, 总市值
                 pe_dyn_val = _get_dom_value('市盈率(动态)') or _get_dom_value('市盈率（动态）')
+                # 页面嵌套布局下 DOM 提取可能命中整个估值卡片文本
+                # （"每股收益：…查看明细>>"），必须先校验为纯数字/亏损，否则丢弃走正则回退
+                if pe_dyn_val and not re_h.fullmatch(r'[\d.]+|亏损', pe_dyn_val.strip()):
+                    pe_dyn_val = None
                 if not pe_dyn_val:
                     m = re_h.search(r'市盈率[（(]动态[）)][：:]\s*([\d.]+|亏损)', text)
                     if m: pe_dyn_val = m.group(1)
                 if pe_dyn_val: data["pe_dynamic"] = pe_dyn_val
 
                 pe_sta_val = _get_dom_value('市盈率(静态)') or _get_dom_value('市盈率（静态）')
+                if pe_sta_val and not re_h.fullmatch(r'[\d.]+|亏损', pe_sta_val.strip()):
+                    pe_sta_val = None
                 if not pe_sta_val:
                     m = re_h.search(r'市盈率[（(]静态[）)][：:]\s*([\d.]+)', text)
                     if m: pe_sta_val = m.group(1)
@@ -1102,6 +1230,8 @@ def fetch_stock_homepage(code: str):
                     except ValueError: pass
 
                 pb_val = _get_dom_value('市净率')
+                if pb_val and not re_h.fullmatch(r'[\d.]+', pb_val.strip()):
+                    pb_val = None
                 if not pb_val:
                     m = re_h.search(r'市净率[：:]\s*([\d.]+)', text)
                     if m: pb_val = m.group(1)
@@ -1279,7 +1409,7 @@ def fetch_stock_holder(code: str):
     3. 前十大股东 (按总股本，含持股数/增减/占比/质押比例/实控人性质)
     4. 退出前十大流通股东列表 (减持信号)
     5. 退出前十大股东列表
-    6. 同业股东人数变化对比 (top10 增加/减少最多)
+    6. 同业股东人数变化对比 (top10 增加/减少最多, 默认隐藏 tab 内嵌表, 数据已在 DOM)
     """
     import asyncio
     try:
@@ -1451,22 +1581,16 @@ def fetch_stock_holder(code: str):
                         }
                     }
 
-                    // 6. 同业股东人数变化对比: tables under "同业" section
-                    // page has two sub-tables: "增加最多" and "减少最多"
-                    // distinguish by scanning preceding sibling text
+                    // 6. 同业股东人数变化对比: 表头含"股东人数"+"增减量"
+                    // 标题格式: "同行业股东人数增减量前10名" / "同行业股东人数增减量后10名"
+                    // (该区块在 chart_nav "股东人数增减排名" tab 下, 默认隐藏但数据已在 DOM,
+                    //   h2 section 仍为"股东人数", 故按表头文本而非 section 匹配)
+                    const tcode = (document.getElementById('stockCode')?.value || '').trim();
                     for (let ti = 0; ti < tables.length; ti++) {
                         const table = tables[ti];
-                        const section = sectionOf(table);
-                        if (!section || !section.includes('同业')) continue;
-                        // find preceding heading text to classify increase vs decrease
-                        let isDecrease = false;
-                        let node = table.previousElementSibling;
-                        while (node) {
-                            const t = (node.textContent || '').trim();
-                            if (t.includes('减少') || t.includes('下降')) { isDecrease = true; break; }
-                            if (t.includes('增加') || t.includes('上升')) { isDecrease = false; break; }
-                            node = node.previousElementSibling;
-                        }
+                        const head = (table.rows[0]?.textContent || '').trim();
+                        if (!head.includes('股东人数') || !head.includes('增减量')) continue;
+                        const isDecrease = head.includes('后10名');
                         const rows = [];
                         for (const tr of table.querySelectorAll('tr')) {
                             const cells = Array.from(tr.querySelectorAll('td, th')).map(td => td.textContent.trim());
@@ -1474,7 +1598,10 @@ def fetch_stock_holder(code: str):
                         }
                         const target = isDecrease ? out.peerComparison.topDecrease : out.peerComparison.topIncrease;
                         for (const r of rows.slice(1)) {
-                            if (r[0] && !r[0].includes('股票简称') && r[0] !== code) {
+                            // 跳过标题行/表头行(标题含"增减量", 表头含"股票简称"/"股东人数")
+                            if (!r[0]) continue;
+                            if (r[0].includes('增减量') || r[0].includes('股票简称') || r[0].includes('股东人数')) continue;
+                            if (r[0] !== tcode) {
                                 target.push({ name: r[0], count: r[1] || '', change: r[2] || '' });
                             }
                         }
@@ -1501,7 +1628,8 @@ def fetch_stock_holder(code: str):
 
 
 # ── fetch_stock_position: 主力持仓/机构持股（同花顺 position 页面）──
-_EM_MARKET_IDS = {"6": 17, "0": 22, "3": 23, "8": 9, "9": 17}
+# marketid 复用 _infer_marketid（旧版 F10 #marketId 官方值提取: 17/33/18/34/151）。
+# 实测 basicapi 接口不校验 marketid（只认 code），此处保持与分红接口同规则统一。
 
 @cached(ttl=3600)
 def fetch_stock_position(code: str):
@@ -1524,9 +1652,8 @@ def fetch_stock_position(code: str):
                 page = await ctx.new_page()
                 await page.set_viewport_size({"width": 1280, "height": 800})
 
-                # 根据代码前缀决定 marketid
-                prefix = code.strip().zfill(6)[0]
-                marketid = _EM_MARKET_IDS.get(prefix, 17)
+                # 根据代码前缀决定 marketid（与分红接口同一套规则）
+                marketid = _infer_marketid(code)
                 url = (f"https://basic.10jqka.com.cn/astockpc/astockmain/index.html"
                        f"#/position?code={code}&marketid={marketid}&code_name=")
 
@@ -3134,6 +3261,246 @@ def fetch_company_events(code: str):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+# ── fetch_stock_dividend: 分红融资（同花顺 F10 astockpc SPA #/bonus）──
+# 新版页面为 JS 渲染，真实数据来自 basicapi REST 接口。通过 playwright 打开
+# SPA 页面并拦截 basicapi 响应（直连同接口亦可，此处以渲染方式保证稳定性）。
+
+
+def _infer_marketid(code: str) -> int:
+    """按 6 位代码前缀推断同花顺 marketid（新版 astockpc F10 URL 参数）。
+
+    实测验证: 60/68(沪A+科创)→17, 90(沪B)→18, 00/30(深A)→33,
+    20(深B)→34, 8/4(北交所)→151
+    """
+    c = str(code).zfill(6)
+    if c.startswith(("60", "68")):
+        return 17
+    if c.startswith("90"):
+        return 18
+    if c.startswith(("00", "30")):
+        return 33
+    if c.startswith("20"):
+        return 34
+    if c.startswith(("8", "4")):
+        return 151
+    return 17
+
+
+@cached(ttl=3600)
+def fetch_stock_dividend(code: str, market: str = "", name: str = ""):
+    """
+    通过 playwright 访问同花顺新版 F10 分红融资页（astockpc SPA #/bonus），
+    拦截 basicapi REST 响应提取:
+    1. programme           分红方案历史（报告期/董事会/股东大会预案/实施公告/
+                           股权登记日/除权除息日/方案/分红总额/进度/股利支付率/分配对象）
+    2. label               分红诊断（送转潜力/派现概率等标签）
+    3. share_info          股票基础信息（ths_code/上市日期）
+    4. additional          增发概况+明细
+    5. allotment           配股概况+明细
+    6. org_allocated_detail 增发机构获配明细
+    7. dividend_ratio      近三年分红比率
+    market 未提供时按代码前缀推断（60/68→17, 90→18, 00/30→33, 20→34, 8/4→151）。
+    """
+    import asyncio
+    import json
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    if not market:
+        market = str(_infer_marketid(code))
+
+    async def _do_query():
+        from urllib.parse import quote
+
+        name_q = quote(name or code)
+        url = (
+            "https://basic.10jqka.com.cn/astockpc/astockmain/index.html"
+            f"#/bonus?code={code}&marketid={market}&code_name={name_q}"
+        )
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 900})
+
+                captured = {}
+                api_prefix = "https://basic.10jqka.com.cn/basicapi"
+
+                async def on_response(resp):
+                    u = resp.url
+                    key = None
+                    if "dividend_ratio" in u:
+                        key = "dividend_ratio"
+                    elif u.startswith(api_prefix):
+                        if "/finance/dividends/v1/programme" in u:
+                            key = "programme"
+                        elif "/finance/dividends/v1/label" in u:
+                            key = "label"
+                        elif "/component/share/v1/share_info" in u:
+                            key = "share_info"
+                        elif "/finance/financing/v1/additional" in u:
+                            key = "additional"
+                        elif "/finance/financing/v1/allotment" in u:
+                            key = "allotment"
+                        elif "/finance/financing/v1/org_allocated_detail" in u:
+                            key = "org_allocated_detail"
+                    if key and key not in captured:
+                        try:
+                            body = await resp.text()
+                            try:
+                                captured[key] = json.loads(body)
+                            except Exception:
+                                captured[key] = {"_raw": body[:2000]}
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                # 信号等待: 分红模块渲染完成
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(document.body && document.body.innerText.includes('分红'))"
+                    ),
+                    timeout=15.0,
+                )
+                await asyncio.sleep(2)  # 等全部 basicapi 响应到齐
+
+                if not captured.get("programme"):
+                    text = ""
+                    try:
+                        text = await page.evaluate("() => document.body.innerText")
+                    except Exception:
+                        pass
+                    return {
+                        "success": False,
+                        "error": "未拦截到分红数据接口响应",
+                        "page_preview": text[:300],
+                    }
+
+                data = {"code": code, "marketid": market}
+                data.update(captured)
+                return {"success": True, "data": data, "source": "同花顺F10(astockpc)"}
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+# ── fetch_stock_news_f10: 新闻公告（同花顺 F10 news.html）──
+# 新闻列表走 basicapi/notice/news 接口（页面内拦截），研报列表为页面渲染表格。
+
+@cached(ttl=3600)
+def fetch_stock_news_f10(code: str, limit: int = 15):
+    """
+    通过 playwright 访问同花顺 F10 news 页面（news.html），提取:
+    1. 新闻列表（拦截 basicapi/notice/news: 标题/来源/作者/日期/链接）
+    2. 研报列表（页面表格: 评级/研报标题/机构/报告日期）
+    """
+    import asyncio
+    import json
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    async def _do_query():
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 900})
+                url = f"https://basic.10jqka.com.cn/{code}/news.html"
+                captured = {"news": None}
+
+                async def on_response(resp):
+                    u = resp.url
+                    if "basicapi/notice/news" in u and captured["news"] is None:
+                        try:
+                            captured["news"] = json.loads(await resp.text())
+                        except Exception:
+                            pass
+
+                page.on("response", on_response)
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                # 信号等待: 公告/研报板块渲染完成
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!(document.body && (document.body.innerText.includes('公告列表') "
+                        "|| document.body.innerText.includes('研报列表')))"
+                    ),
+                    timeout=15.0,
+                )
+                await asyncio.sleep(2)  # 等新闻接口响应到齐
+
+                # 研报表: 表头含"评级"（评级/研报标题/机构/报告日期）
+                research = await page.evaluate(
+                    """() => {
+                        const out = [];
+                        for (const t of document.querySelectorAll('table')) {
+                            const head = (t.innerText || '').slice(0, 40);
+                            if (!head.includes('评级')) continue;
+                            const rows = t.querySelectorAll('tr');
+                            for (let i = 1; i < rows.length && out.length < 20; i++) {
+                                const cells = Array.from(rows[i].querySelectorAll('td, th'))
+                                    .map(c => (c.textContent || '').trim());
+                                if (cells.length >= 4) {
+                                    out.push({rating: cells[0], report: cells[1],
+                                              institution: cells[2], date: cells[3]});
+                                }
+                            }
+                        }
+                        return out;
+                    }"""
+                )
+
+                if captured["news"] is None:
+                    return {"success": False, "error": "未拦截到新闻接口响应"}
+
+                nd = captured["news"].get("data", {})
+                news_items = []
+                for it in (nd.get("data") or [])[:limit]:
+                    news_items.append({
+                        "seq": it.get("seq"),
+                        "title": it.get("title"),
+                        "date": it.get("date"),
+                        "source": it.get("source"),
+                        "author": it.get("author"),
+                        "url": it.get("pc_url") or it.get("mobile_url") or it.get("client_url"),
+                    })
+                return {
+                    "success": True,
+                    "data": {
+                        "code": code,
+                        "total": nd.get("total"),
+                        "news": news_items,
+                        "research_reports": research,
+                    },
+                    "source": "同花顺F10",
+                }
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 # ── fetch_industry_hotmap: 大盘星图行业热力 (东财 stockhotmap) ──
 # 全市场个股 → 三级行业归属聚合。数据源: quote.eastmoney.com/stockhotmap 页面的
 # getmcode/getquotebasedata/getquotedata 三个 API（绕过 push2 风控），其中约 5%
@@ -4191,7 +4558,7 @@ _ARTICLE_SELECTORS = {
     "cls.cn":            (".article-content", ".rich_media_content", "#content"),
     "stcn.com":          (".article-content", "#content"),
     "sina.com.cn":       (".article", "#artibody", "#article"),
-    "10jqka.com.cn":     (".main-content", "#content", ".atc-content"),
+    "10jqka.com.cn":     (".news-content.article-content", ".news-content-parsed", ".main-content", "#content", ".atc-content"),
     "mp.weixin.qq.com":  (".rich_media_content", "#js_content"),
 }
 
@@ -4358,7 +4725,9 @@ ROUTES = {
     "/api/wencai-all":           ("问财全数据(问财)",        fetch_wencai_all, ["code"]),
     "/api/eps-forecast":         ("EPS一致预期(同花顺F10)",  fetch_eps_forecast, ["code"]),
     "/api/executive-changes":    ("高管持股变动(东方财富)",  fetch_executive_changes, ["code"]),
-    "/api/company-events":       ("公司大事(同花顺F10)",    fetch_company_events, ["code"]),
+    "/api/company-events":      ("公司大事(同花顺F10)",    fetch_company_events, ["code"]),
+    "/api/stock-dividend":      ("分红融资(同花顺F10)",    fetch_stock_dividend, ["code"]),
+    "/api/stock-news-f10":      ("新闻公告(同花顺F10)",    fetch_stock_news_f10, ["code"]),
     "/api/industry-hotmap":      ("大盘星图行业热力(东财)",  fetch_industry_hotmap, ["level", "top_n"]),
     "/api/industry-board":       ("行业板块排名(东财页面爬取)", fetch_industry_board, ["top_n"]),
     "/api/global-news-cls":      ("全球快讯(财联社电报爬取)",  fetch_global_news_cls, ["limit"]),
@@ -4453,21 +4822,30 @@ class DataHandler(BaseHTTPRequestHandler):
                             except (ValueError, TypeError):
                                 pass
                         kwargs[k] = v
-                # Cache hits bypass _cdp_lock (no Chrome access needed).
-                # Only cache misses (actual Chrome page operations) serialize.
-                hit, cached_data = _cache_lookup(func, args, kwargs)
-                if hit:
-                    result = cached_data
+                # 缓存快速路径 + SWR/single-flight:
+                # fresh → 直返(无锁); stale → 返回旧数据+后台刷新(零等待);
+                # miss → single-flight 合并并发冷调用(锁外等待 leader)。
+                if required_params:
+                    args = [params[p] for p in required_params]
+                    # Pass optional query params that the function accepts (e.g. start, end, days)
+                    kwargs = {}
+                    for k, v in params.items():
+                        if k not in required_params and k in func_params:
+                            ann = func_params[k].annotation
+                            if ann == int:
+                                try:
+                                    v = int(v)
+                                except (ValueError, TypeError):
+                                    pass
+                            elif ann == float:
+                                try:
+                                    v = float(v)
+                                except (ValueError, TypeError):
+                                    pass
+                            kwargs[k] = v
+                    result = _serve_cached(func, args, kwargs)
                 else:
-                    with _cdp_lock:
-                        result = func(*args, **kwargs)
-            else:
-                hit, cached_data = _cache_lookup(func)
-                if hit:
-                    result = cached_data
-                else:
-                    with _cdp_lock:
-                        result = func()
+                    result = _serve_cached(func, (), {})
             try:
                 self._send_json(result)
             except Exception:

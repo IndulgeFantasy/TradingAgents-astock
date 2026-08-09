@@ -62,7 +62,7 @@ def get_global_news(
     return route_to_vendor("get_global_news", curr_date, look_back_days, limit)
 
 @tool
-def get_insider_transactions(
+def get_company_events(
     ticker: Annotated[str, "6-digit A-stock code (e.g. 600379). Must be numeric, NOT company name"],
 ) -> str:
     """
@@ -78,7 +78,7 @@ def get_insider_transactions(
     Returns:
         str: Company events report
     """
-    ok, code_or_message = _validate_a_stock_code("get_insider_transactions", ticker)
+    ok, code_or_message = _validate_a_stock_code("get_company_events", ticker)
     if not ok:
         return code_or_message
-    return route_to_vendor("get_insider_transactions", code_or_message)
+    return route_to_vendor("get_company_events", code_or_message)

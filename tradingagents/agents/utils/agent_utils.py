@@ -19,7 +19,7 @@ from tradingagents.agents.utils.fundamental_data_tools import (
 )
 from tradingagents.agents.utils.news_data_tools import (
     get_news,
-    get_insider_transactions,
+    get_company_events,
     get_global_news
 )
 from tradingagents.agents.utils.signal_data_tools import (
@@ -39,6 +39,7 @@ from tradingagents.agents.utils.playwright_tools import (
     get_stock_homepage,
     get_stock_industry_peers,
     get_stock_holder,
+    get_stock_dividend,
     get_stock_equity_history,
     get_stock_position,
     get_market_context,
@@ -49,6 +50,7 @@ from tradingagents.agents.utils.playwright_tools import (
     get_web_search,
     get_article_content,
     get_stock_news,
+    get_f10_news,
 )
 from tradingagents.agents.utils.analysis_tools import (
     analyze_pattern,
