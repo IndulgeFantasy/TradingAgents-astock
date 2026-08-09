@@ -972,7 +972,13 @@ def get_fundamentals(
         return f"Error retrieving fundamentals for {code}: {str(e)}"
 
 
-# ---- 4. get_balance_sheet ----
+# ---- 4. get_balance_sheet / get_cashflow / get_income_statement ----
+#
+# ⚠️ 新浪直连已禁用（2026-08）：getFinanceReport2022 接口结构改版为
+# result.data.report_list（按报告期嵌套），旧解析逻辑返回空数据。
+# 三大报表全量明细改走同花顺F10 playwright 端点（/api/financial-quarterly，
+# finance.html 自定义指标面板 + getFinanceEdit.php，102 期全量科目）。
+# 下方 _get_financial_report_sina 保留仅供追溯，不再被调用。
 
 
 def _sina_stock_code(code: str) -> str:
@@ -983,10 +989,7 @@ def _sina_stock_code(code: str) -> str:
 def _get_financial_report_sina(
     code: str, report_type: str, freq: str, curr_date: str = None,
 ) -> pd.DataFrame:
-    """Shared helper: fetch financial report via Sina direct HTTP API.
-
-    report_type: '资产负债表' | '利润表' | '现金流量表'
-    """
+    """⚠️ 已禁用（新浪接口结构改版，返回空）。保留仅供追溯。"""
     _report_type_map = {
         "资产负债表": "fzb",
         "利润表": "lrb",
@@ -1028,32 +1031,54 @@ def _get_financial_report_sina(
     return df.head(8)
 
 
+def _fetch_statement_playwright(code: str, key: str, label: str) -> str:
+    """三大报表全量明细（同花顺F10 playwright，单位亿元，报告期由新到旧）。"""
+    try:
+        from playwright_service.client import PlaywrightClient
+
+        result = PlaywrightClient().financial_quarterly(code)
+        if not result.get("success"):
+            return (
+                f"No {label} data found for A-stock '{code}': "
+                f"{result.get('error', '')}"
+            )
+        st = result.get(key)
+        if not st:
+            return f"No {label} data found for A-stock '{code}'"
+        periods = st.get("periods") or []
+        items = st.get("items") or {}
+        if not items:
+            return f"No {label} data found for A-stock '{code}'"
+        lines = [
+            f"# {label} for {code} (A-stock)",
+            "# Data source: 同花顺F10 (playwright)",
+            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# 单位: 亿元 | {len(items)} 科目 × {len(periods)} 期 (报告期由新到旧)",
+            "",
+        ]
+        lines.append("报告期: " + ", ".join(str(p) for p in periods))
+        for name, vals in items.items():
+            if isinstance(vals, list) and vals:
+                lines.append(
+                    f"{name}: " + ", ".join(
+                        "--" if v is False or v is None else str(v) for v in vals
+                    )
+                )
+            else:
+                lines.append(f"{name}: {vals}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error retrieving {label} for {code}: {str(e)}"
+
+
 def get_balance_sheet(
     ticker: Annotated[str, "A-stock code"],
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get balance sheet via Sina direct HTTP API."""
+    """Get balance sheet (同花顺F10 playwright, 全量科目×期数)."""
     code = _normalize_ticker(ticker)
-
-    try:
-        df = _get_financial_report_sina(code, "资产负债表", freq, curr_date)
-
-        if df.empty:
-            return f"No balance sheet data found for A-stock '{code}'"
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
-    except Exception as e:
-        return f"Error retrieving balance sheet for {code}: {str(e)}"
+    return _fetch_statement_playwright(code, "balance_sheet", "balance sheet")
 
 
 # ---- 5. get_cashflow ----
@@ -1064,27 +1089,9 @@ def get_cashflow(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get cash flow statement via Sina direct HTTP API."""
+    """Get cash flow statement (同花顺F10 playwright, 全量科目×期数)."""
     code = _normalize_ticker(ticker)
-
-    try:
-        df = _get_financial_report_sina(code, "现金流量表", freq, curr_date)
-
-        if df.empty:
-            return f"No cash flow data found for A-stock '{code}'"
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Cash Flow for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
-    except Exception as e:
-        return f"Error retrieving cash flow for {code}: {str(e)}"
+    return _fetch_statement_playwright(code, "cash_flow", "cash flow")
 
 
 # ---- 6. get_income_statement ----
@@ -1095,27 +1102,9 @@ def get_income_statement(
     freq: Annotated[str, "frequency: 'annual' or 'quarterly'"] = "quarterly",
     curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """Get income statement via Sina direct HTTP API."""
+    """Get income statement (同花顺F10 playwright, 全量科目×期数)."""
     code = _normalize_ticker(ticker)
-
-    try:
-        df = _get_financial_report_sina(code, "利润表", freq, curr_date)
-
-        if df.empty:
-            return f"No income statement data found for A-stock '{code}'"
-
-        csv_string = df.to_csv(index=False)
-
-        header = f"# Income Statement for {code} (A-stock, {freq})\n"
-        header += "# Data source: sina direct HTTP\n"
-        header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-
-        return header + csv_string
-
-    except Exception as e:
-        return f"Error retrieving income statement for {code}: {str(e)}"
+    return _fetch_statement_playwright(code, "income_statement", "income statement")
 
 
 # ---- 7. get_news ----
@@ -1761,6 +1750,24 @@ def _load_northbound_history(n: int = 20) -> list[tuple[str, float, float]]:
     return rows[-n:]
 
 
+# 交易所自 2024-08-16 起停止发布北向实时净买入，同花顺 hsgtApi 自 2026-07
+# 起仅返回同一份静态占位快照（收盘值整月不变，如 SGT=379.75/HGT=-9.28）。
+# 置 True 时跳过实时抓取、只声明数据不可用，不再写缓存；数据源恢复后置 False 即可。
+NORTHBOUND_REALTIME_DISABLED = True
+
+
+def _dedupe_placeholder_rows(
+    rows: list[tuple[str, float, float]],
+) -> list[tuple[str, float, float]]:
+    """剔除连续多日 HGT/SGT 收盘值完全一致的占位行（保留每组首次出现的行）。"""
+    cleaned: list[tuple[str, float, float]] = []
+    for date, h, s in rows:
+        if cleaned and cleaned[-1][1] == h and cleaned[-1][2] == s:
+            continue
+        cleaned.append((date, h, s))
+    return cleaned
+
+
 def get_northbound_flow(
     curr_date: Annotated[str, "Date YYYY-MM-DD"],
     include_history: Annotated[
@@ -1772,7 +1779,31 @@ def get_northbound_flow(
     Realtime: minute-level cumulative net buying for HGT(沪股通) + SGT(深股通).
     History: self-cached daily close snapshots (upstream APIs stopped updating
     northbound history since 2024-08).
+    NOTE: 实时净买入已于 2026-08 起暂停抓取（上游仅返回占位快照）。
     """
+    if NORTHBOUND_REALTIME_DISABLED:
+        lines = [
+            f"# Northbound Capital Flow ({curr_date})",
+            "# Source: 同花顺 hsgtApi (沪深股通) + local cache",
+            "",
+            "北向资金净买入已停止发布：交易所自 2024-08-16 起停止公布北向实时净买入，"
+            "上游接口仅返回疑似缓存占位快照，实时抓取已暂停，净买入数据不可用。",
+            "可参考：南向资金净买入（本工具历史数据）与北向资金成交额合计（get_market_context）。",
+        ]
+        if include_history:
+            history = _dedupe_placeholder_rows(_load_northbound_history(20))
+            if history:
+                lines.append("\n## Historical Daily Close (local cache, 亿元)")
+                lines.append("Date       | HGT(沪股通) | SGT(深股通) | Total")
+                for date, h, s in history:
+                    lines.append(f"  {date}: HGT={h:.2f} SGT={s:.2f} Total={h + s:.2f}")
+            else:
+                lines.append(
+                    "\n## Historical Daily: No cached data yet. "
+                    "History accumulates only while realtime fetch is enabled."
+                )
+        return "\n".join(lines)
+
     import requests
 
     hsgt_headers = {

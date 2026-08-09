@@ -600,6 +600,34 @@ def get_financial_quarterly(code: str) -> str:
                 for l in liabilities:
                     lines.append(f"    {l.get('name',''):<16} {l.get('value','')}")
 
+        # 三大报表全量科目明细（同花顺F10, 单位: 亿元）
+        for key, label in [("balance_sheet", "资产负债表"),
+                           ("income_statement", "利润表"),
+                           ("cash_flow", "现金流量表")]:
+            st = result.get(key)
+            if not st:
+                continue
+            periods = st.get("periods") or []
+            items = st.get("items") or {}
+            yoy = st.get("yoy") or {}
+            lines.append(f"\n## {label} (全量 {len(items)} 科目 × {len(periods)} 期, 单位: 亿元, 报告期由新到旧)")
+            if not items:
+                lines.append(f"  [数据缺失: {label}]")
+                continue
+            lines.append("  报告期: " + ", ".join(periods))
+            for name, vals in items.items():
+                if isinstance(vals, list) and vals:
+                    row = f"  {name}: " + ", ".join(
+                        "--" if v is False or v is None else str(v) for v in vals
+                    )
+                else:
+                    row = f"  {name}: {vals}"
+                if yoy.get(name):
+                    row += f"  | 同比: " + ", ".join(
+                        "--" if v is False or v is None else str(v) for v in yoy[name]
+                    )
+                lines.append(row)
+
         return "\n".join(lines)
     except Exception as e:
         return f"[季频数据] 获取异常: {e}"

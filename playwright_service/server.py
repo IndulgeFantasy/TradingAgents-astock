@@ -1614,6 +1614,7 @@ def fetch_financial_quarterly(code: str):
     2. 指标变动说明 (5 个子表：成长/盈利/负债/运营/现金流，含变动原因文字说明)
     3. 财务报告审计意见 (最近 4 年年报审计意见)
     4. 资产负债构成 (资产 6 行 + 负债 5 行)
+    5. 三大报表全量科目明细 (资产负债表/利润表/现金流量表, 全量期数, 经 getFinanceEdit.php)
     """
     import asyncio
     try:
@@ -1867,6 +1868,9 @@ def fetch_financial_quarterly(code: str):
                 assets_data = raw.get("assets", [])
                 liabilities_data = raw.get("liabilities", [])
 
+                # === 5. 三大报表全量科目明细（getFinanceEdit.php 分批拉取）===
+                statements = await _fetch_three_statements(page, code)
+
                 return {
                     "success": True,
                     "data": results,
@@ -1877,6 +1881,9 @@ def fetch_financial_quarterly(code: str):
                     "audit": audit_data,
                     "assets": assets_data,
                     "liabilities": liabilities_data,
+                    "balance_sheet": statements.get("balanceSheet"),
+                    "income_statement": statements.get("incomeState"),
+                    "cash_flow": statements.get("cashFlow"),
                 }
 
             finally:
@@ -1889,6 +1896,95 @@ def fetch_financial_quarterly(code: str):
         return asyncio.run(_do_query())
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 三大报表全量科目明细（finance.html 自定义指标面板 + getFinanceEdit.php）
+# 页面内嵌科目库（final_result: balanceSheet/incomeState/cashFlow），
+# 勾选科目后由 JS 经 getFinanceEdit.php?type=all&data=[["科目","元",0,false,true],...]
+# 拉取全量期数数值（约 8 年 100+ 期）。此处复刻该机制，分批 ≤20 科目/请求。
+# ═══════════════════════════════════════════════════════════════
+
+_STATEMENT_BATCH = 20  # getFinanceEdit.php data 参数单批科目上限
+
+
+async def _fetch_three_statements(page, code: str) -> dict:
+    """从已打开的 finance.html 页面提取三大报表全量科目明细。
+
+    Returns:
+        {"balanceSheet": {...}, "incomeState": {...}, "cashFlow": {...}}
+        每个报表: {"periods": [报告期...], "items": {科目: [数值...]}, "yoy": {科目: [同比...]} | None}
+        任一步骤失败返回空 dict（不影响指标矩阵等主数据）。
+    """
+    try:
+        # 1. 从自定义指标面板提取三组科目名
+        groups = await page.evaluate("""() => {
+            const out = {balanceSheet: [], incomeState: [], cashFlow: []};
+            document.querySelectorAll('.final_result li').forEach(li => {
+                const cls = li.getAttribute('data-class') || '';
+                const name = (li.textContent || '').trim().replace(/\\s+/g, '');
+                if (out[cls] && name) out[cls].push(name);
+            });
+            return out;
+        }""")
+
+        # 2. 每类报表分批拉取（data 参数 = [["科目","元",0,false,true],...]）
+        result = {}
+        for cls, names in groups.items():
+            if not names:
+                result[cls] = None
+                continue
+            periods = None
+            items = {}
+            yoy = {}
+            for i in range(0, len(names), _STATEMENT_BATCH):
+                batch = names[i:i + _STATEMENT_BATCH]
+                payload = json.dumps([[n, "元", 0, False, True] for n in batch], ensure_ascii=False)
+                text = await page.evaluate("""async (args) => {
+                    const params = new URLSearchParams({type: 'all', data: args.payload, code: args.code});
+                    const m = document.cookie.match(/(?:^|;\\s*)userid=([^;]+)/);
+                    if (m) params.set('userid', m[1]);
+                    const r = await fetch(
+                        'https://basic.10jqka.com.cn/api/getFinanceEdit.php?' + params.toString(),
+                        {credentials: 'include'}
+                    );
+                    return await r.text();
+                }""", {"payload": payload, "code": code})
+                try:
+                    d = json.loads(text)
+                except (ValueError, TypeError):
+                    continue
+                dd = d.get("data") or {}
+                title = dd.get("title") or []
+                report = dd.get("report") or []
+                if not report or not title:
+                    continue
+                if periods is None:
+                    periods = list(report[0])
+                # report[0]=报告期, report[i]=第 i 个科目的数值; title[i]=[科目名,单位]
+                for i2 in range(1, min(len(report), len(title))):
+                    name = title[i2][0] if isinstance(title[i2], (list, tuple)) else str(title[i2])
+                    if not name:
+                        continue
+                    items[name] = list(report[i2])
+                    # 同比列（若存在且与数值等长）
+                    ry = dd.get("report_yoy") or dd.get("yoy")
+                    if ry and i2 < len(ry):
+                        yoy[name] = list(ry[i2])
+            if periods:
+                result[cls] = {
+                    "periods": periods,
+                    "items": items,
+                    "yoy": yoy if yoy else None,
+                    "rows": len(items),
+                    "total_periods": len(periods),
+                }
+            else:
+                result[cls] = None
+        return result
+    except Exception as e:
+        logger.warning("fetch three statements failed for %s: %s", code, str(e)[:200])
+        return {}
 
 
 # ── fetch_stock_industry_peers: 同行业对标（同花顺 field.html）──
