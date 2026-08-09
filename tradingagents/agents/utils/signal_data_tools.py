@@ -6,6 +6,7 @@ from tradingagents.dataflows.interface import route_to_vendor
 @tool
 def get_profit_forecast(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    curr_date: Annotated[str, "Analysis date in YYYY-MM-DD format (required)"],
 ) -> str:
     """
     Retrieve consensus EPS forecasts and analyst ratings from 同花顺F10.
@@ -13,12 +14,18 @@ def get_profit_forecast(
     详细指标预测(营收/净利/ROE/PE等12指标×6年), Forward PE/PEG/PE消化时间,
     机构评级分布(买入/增持/中性/减持/卖出), 逐条研报评级(机构+评级+标题+日期),
     机构观点摘要.
+
+    ⚠️ curr_date 是**必填**：一致预期只有"当前"版本，没有历史时点值。数据层靠这个
+    参数判断是不是在复盘历史，并在正文顶部加未来函数告警。给默认值等于没设防——
+    模型按 {"ticker": "600519"} 调用时 curr_date 为空串，判定为"非历史"，告警永远
+    不触发，今天的预测就被当成分析日当天的事实（v0.5.5 加告警，v0.5.8 才真正生效）。
     Args:
         ticker (str): A-stock code
+        curr_date (str): Analysis date, used to flag look-ahead when historical
     Returns:
         str: Consensus forecast report with valuation metrics and analyst ratings
     """
-    return route_to_vendor("get_profit_forecast", ticker)
+    return route_to_vendor("get_profit_forecast", ticker, curr_date)
 
 
 @tool

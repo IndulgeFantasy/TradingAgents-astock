@@ -11,6 +11,9 @@ def create_social_media_analyst(llm):
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 
+        # 情绪不能只靠读新闻推断（#61）：光看文本，模型很容易把"这条新闻听起来利好"
+        # 当成"市场情绪乐观"，而资金可能正在流出。加上资金流 / 热度榜 / 量价三样
+        # 可核对的硬数据，让情绪判断有据可依，也能暴露"消息面与资金面背离"。
         tools = [
             get_news,
             get_fund_flow,
