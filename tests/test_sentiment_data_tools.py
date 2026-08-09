@@ -57,7 +57,8 @@ def test_prompt_names_every_bound_tool():
 def test_prompt_requires_divergence_check():
     """资金面与消息面背离是情绪分析最有价值的产出，必须强制写进报告。"""
     src = inspect.getsource(sma.create_social_media_analyst)
-    assert "背离" in src
+    assert "一致/背离" in src, "提示词必须要求判断资金面与消息面是否一致/背离"
+    assert "背离时说明方向" in src
 
 
 def test_prompt_forbids_fabricating_missing_data():
