@@ -226,6 +226,18 @@ class PlaywrightClient:
         """新闻公告 (同花顺F10 news.html): 新闻列表+研报列表"""
         return self._get("/api/stock-news-f10", {"code": code, "limit": limit})
 
+    def stock_concept(self, code: str, market: str = "", name: str = "") -> dict:
+        """概念板块明细 (同花顺F10 astockpc SPA #/concept): 概念名/龙头股/解析
+
+        market 留空时服务端按代码前缀自动推断（与分红接口同一套规则）。
+        """
+        params = {"code": code}
+        if market:
+            params["market"] = market
+        if name:
+            params["name"] = name
+        return self._get("/api/stock-concept", params)
+
     def industry_hotmap(self, level: str = "bk2", top_n: int = 20, ticker: str = "") -> dict:
         """大盘星图行业热力 (东财 stockhotmap): 全市场个股按行业聚合排名。
 

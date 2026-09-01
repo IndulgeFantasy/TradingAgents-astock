@@ -437,6 +437,15 @@ class TradingAgentsGraph:
             if effort:
                 kwargs["effort"] = effort
 
+        # config 里显式配 max_tokens 可覆盖全局默认（优先级最高）。
+        # 读取入口在 llm_clients/factory.py（setdefault 不覆盖显式传入值）。
+        mt = self.config.get("max_tokens")
+        if mt:
+            try:
+                kwargs["max_tokens"] = int(mt)
+            except (TypeError, ValueError):
+                logger.warning("config 里 max_tokens=%r 不是整数，忽略", mt)
+
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:

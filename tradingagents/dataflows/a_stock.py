@@ -1296,6 +1296,17 @@ def _get_financial_report_sina(
     return df.head(8)
 
 
+def _statement_time_line(result: dict) -> str:
+    """三表渲染的数据时间行。服务端 SWR stale 命中时标注真实抓取时刻,
+    防止 LLM 把缓存旧数据当最新数据。"""
+    if result.get("stale") and result.get("fetched_at"):
+        return (
+            f"# ⚠️ 数据时间: {result['fetched_at']} "
+            f"(缓存旧数据, 后台刷新中)"
+        )
+    return f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+
 def _fetch_statement_playwright(code: str, key: str, label: str) -> str:
     """三大报表全量明细（同花顺F10 playwright，单位亿元，报告期由新到旧）。"""
     try:
@@ -1317,7 +1328,7 @@ def _fetch_statement_playwright(code: str, key: str, label: str) -> str:
         lines = [
             f"# {label} for {code} (A-stock)",
             "# Data source: 同花顺F10 (playwright)",
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            _statement_time_line(result),
             f"# 单位: 亿元 | {len(items)} 科目 × {len(periods)} 期 (报告期由新到旧)",
             "",
         ]

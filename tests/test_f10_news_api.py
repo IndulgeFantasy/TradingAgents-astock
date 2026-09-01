@@ -147,3 +147,42 @@ def test_playwright_spa_news_renders_and_intercepts():
     body = captured["news"]
     assert '"status_code":0' in body
     assert '"title"' in body
+
+
+@pytest.mark.integration
+def test_trafilatura_fallback_extracts_article():
+    """trafilatura 兜底：结构各异的外站页面（含大量导航噪音）能提取出正文。
+
+    等价于 server 端 _extract_with_trafilatura 的兜底路径；
+    无 trafilatura 环境（base env）自动跳过。
+    """
+    trafilatura = pytest.importorskip("trafilatura")
+    import importlib
+
+    server_mod = importlib.import_module("playwright_service.server")
+
+    # 模拟外站转载页: 导航噪音 + 正文（非本站选择器覆盖的结构）
+    html = """<!DOCTYPE html>
+<html><head><title>伊利健康奶牛养殖技术在宁夏落地扎根 - 银川新闻网</title></head>
+<body>
+<header><nav><a href="/">首页</a><a href="/news/">新闻</a><a href="/video/">视频</a></nav></header>
+<div class="breadcrumb">当前位置：首页&gt;新闻中心&gt;资讯</div>
+<div class="sidebar"><ul><li>热门推荐1</li><li>热门推荐2</li><li>热门推荐3</li><li>热门推荐4</li><li>热门推荐5</li></ul></div>
+<div class="main-text">
+<h1>健康养殖+精准诊疗+技术赋能：伊利健康奶牛养殖技术在宁夏落地扎根</h1>
+<p class="meta">2026-08-07 来源：银川新闻网</p>
+<p>近日，伊利集团在宁夏银川召开奶业高质量发展技术交流会，正式发布健康奶牛养殖技术方案。</p>
+<p>该方案涵盖健康养殖、精准诊疗、技术赋能三大模块，将推动宁夏奶牛养殖业提质增效。</p>
+<p>与会专家表示，该技术的落地将为西北奶业振兴提供可复制的样板。</p>
+</div>
+<div class="footer">版权所有 银川新闻网 | 关于我们 | 联系方式 | 广告服务</div>
+</body></html>
+"""
+    text = server_mod._extract_with_trafilatura(html)
+    assert text, "trafilatura 未提取到正文"
+    assert "健康奶牛养殖技术" in text, "正文核心内容缺失"
+    assert "伊利集团" in text
+    # 导航噪音不应混入正文
+    assert "热门推荐" not in text
+    assert "版权所有" not in text
+    assert "当前位置" not in text

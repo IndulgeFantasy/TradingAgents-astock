@@ -48,6 +48,17 @@ def _now() -> str:
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _data_time_line(result: dict, label: str = "获取时间") -> str:
+    """返回数据时间标注行。
+
+    服务端 SWR stale 命中时, 响应含 stale/fetched_at(真实抓取时刻)——
+    必须标注, 防止 LLM 把旧数据当最新数据; 否则渲染层"获取时间=现在"会误导。
+    """
+    if result.get("stale") and result.get("fetched_at"):
+        return f"# ⚠️ 数据时间: {result['fetched_at']} (缓存旧数据, 后台刷新中)"
+    return f"# {label}: {_now()}"
+
+
 # ═══════════════════════════════════════════════════════════════
 # Standalone tools (9) — no a_stock equivalent
 # ═══════════════════════════════════════════════════════════════
@@ -64,7 +75,7 @@ def get_stock_basic(code: str) -> str:
         lines = [
             f"# 股本结构: {data.get('name', code)} ({code})",
             f"# 数据源: 同花顺F10",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         ts = data.get("总股本")
@@ -114,7 +125,7 @@ def get_stock_homepage(code: str) -> str:
         lines = [
             f"# 综合概要: {d.get('name', code)} ({code})",
             f"# 数据源: 同花顺F10",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         pe_d = d.get("pe_dynamic", "N/A")
@@ -152,7 +163,7 @@ def get_stock_dividend(code: str) -> str:
         lines = [
             f"# 分红融资: {code}",
             f"# 数据源: 同花顺F10 (astockpc)",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
 
@@ -270,7 +281,7 @@ def get_stock_industry_peers(code: str) -> str:
         lines = [
             f"# 同行业对标: {data.get('industry', 'N/A')}",
             f"# 数据源: 同花顺F10",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         if data.get("companyRank"):
@@ -298,7 +309,7 @@ def get_stock_holder(code: str) -> str:
         lines = [
             f"# 股东研究: {code}",
             f"# 数据源: 同花顺F10",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
 
@@ -408,7 +419,7 @@ def get_stock_equity_history(code: str) -> str:
         lines = [
             f"# 股本历史变动: {code}",
             f"# 数据源: 同花顺F10",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         ss = data.get("shareStructure", [])
@@ -441,7 +452,7 @@ def get_stock_position(code: str) -> str:
         lines = [
             f"# 主力持仓: {code}",
             f"# 数据源: 同花顺F10",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         sm = data.get("institutionSummary", [])
@@ -812,7 +823,7 @@ def get_industry_hotmap(
             return f"[行业热力] 获取失败: {result.get('error', '')}"
         lines = [
             f"# 大盘星图行业热力 (东财) | {result.get('level', level)} | 共 {result.get('total_industries', 0)} 个行业",
-            f"# 行情时间: {_now()}",
+            _data_time_line(result, "行情时间"),
             "",
             "# 说明: 行业涨跌幅为个股流通市值加权近似值（非官方板块指数口径）",
             "",
@@ -946,7 +957,7 @@ def get_stock_news(
             return "[股市新闻] 无数据"
         lines = [
             f"# 东财股市聚焦新闻 (stock.eastmoney.com) | 共 {result.get('total', len(items))} 条，显示 {len(items)} 条",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         for it in items:
@@ -986,7 +997,7 @@ def get_f10_news(
         lines = [
             f"# F10 新闻公告: {code}",
             f"# 数据源: 同花顺F10 (news.html)",
-            f"# 获取时间: {_now()}",
+            _data_time_line(result),
             "",
         ]
         news = data.get("news") or []
@@ -1055,29 +1066,58 @@ def get_article_content(
 def get_concept_blocks_playwright(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
-    """概念板块归属（问财版）: 所属概念板块列表 + 行业分类。"""
+    """概念板块归属（同花顺F10概念题材页）: 相关概念明细 + 上涨周期。
+
+    数据源: 新版 F10 astockpc #/concept（问财通道概念数据不稳定，已切换）。
+    上涨周期含: 概念组合上涨时间/区间涨幅/主力资金/区间换手 + 驱动逻辑(AI解读)。
+    """
     try:
         client = _get_client()
-        result = client.concept_blocks(ticker)
+        result = client.stock_concept(ticker)
         if not result.get("success"):
             return f"[概念板块] {ticker}: {result.get('error', '')}"
         data = result.get("data", {})
         concepts = data.get("concepts", [])
-        industry = data.get("industry", "")
-        name = data.get("name", "") or ticker
-        if not concepts:
+        rise_cycles = data.get("rise_cycles") or []
+        if not concepts and not rise_cycles:
             return f"[概念板块] {ticker}: 未查询到概念归属"
         lines = [
-            f"# 概念板块归属: {name} ({ticker})",
-            f"# 数据源: 同花顺问财",
+            f"# 概念板块归属: {ticker}",
+            f"# 数据源: 同花顺F10 (astockpc #/concept)",
             "",
         ]
-        if industry:
-            ind_str = industry if isinstance(industry, str) else " -> ".join(industry)
-            lines.append(f"行业分类: {ind_str}")
-        lines.append(f"概念板块 ({len(concepts)} 个):")
-        for c in concepts:
-            lines.append(f"  - {c}")
+        if concepts:
+            lines.append(f"相关概念 ({len(concepts)} 个):")
+            for i, c in enumerate(concepts, 1):
+                name = c.get("name", "")
+                tag = c.get("tag", "")
+                stocks = c.get("leading_stocks", [])
+                analysis = c.get("analysis", "")
+                title = f"{i}. {name}"
+                if tag:
+                    title += f" [{tag}]"
+                lines.append(f"\n{title}")
+                if stocks:
+                    lines.append(f"  龙头股: {'、'.join(stocks)}")
+                if analysis:
+                    lines.append(f"  概念解析: {analysis[:200]}")
+        if rise_cycles:
+            lines.append("\n## 上涨周期（概念组合走势与驱动逻辑）")
+            for rc in rise_cycles:
+                tags = rc.get("concepts", [])
+                metrics = rc.get("metrics", {})
+                interp = rc.get("interpretation", "")
+                tag_str = " + ".join(tags) if tags else "—"
+                lines.append(f"\n### {tag_str}")
+                if metrics:
+                    parts = []
+                    for k in ("上涨时间", "区间涨幅", "区间涨跌", "主力资金", "区间换手"):
+                        if metrics.get(k):
+                            parts.append(f"{k}: {metrics[k]}")
+                    if parts:
+                        lines.append("  " + " | ".join(parts))
+                if interp:
+                    lines.append(f"  驱动逻辑: {interp[:300]}")
         return "\n".join(lines)
     except Exception as e:
         return f"[概念板块] 获取异常: {e}"
@@ -1181,8 +1221,13 @@ def get_fund_flow_playwright(
 
 def get_profit_forecast_playwright(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    curr_date: Annotated[str, "Analysis date in YYYY-MM-DD format"] = None,
 ) -> str:
-    """机构盈利预测（同花顺F10详细版）: EPS/净利润一致预期 + 机构预测明细 + 详细指标 + 研报观点。"""
+    """机构盈利预测（同花顺F10详细版）: EPS/净利润一致预期 + 机构预测明细 + 详细指标 + 研报观点。
+
+    注意: 签名与 a_stock 实现一致（ticker, curr_date）——经 route_to_vendor 以
+    双参调用；历史日期在正文顶部加未来函数告警。
+    """
     try:
         client = _get_client()
         result = client.eps_forecast(ticker)
@@ -1197,6 +1242,12 @@ def get_profit_forecast_playwright(
         if stock_name:
             header += f" ({stock_name})"
         lines = [header, "# 数据源: 同花顺F10", ""]
+        # 一致预期只有"当前"版本，没有历史时点值——复盘历史时必须明说
+        if curr_date:
+            from tradingagents.dataflows.a_stock import _is_historical, _snapshot_notice
+
+            if _is_historical(curr_date):
+                lines.insert(0, _snapshot_notice(curr_date, "分析师一致预期"))
 
         if ic:
             lines.append(f"覆盖机构数: {ic} 家")

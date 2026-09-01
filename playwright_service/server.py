@@ -206,7 +206,7 @@ def _cache_key(func_name, args, kwargs):
     return f"{func_name}:{args}:{ {k: v for k, v in kwargs.items() if v is not None} }"
 
 
-def _store_cache(key, result, ttl, is_error=False):
+def _store_cache(key, result, ttl, is_error=False, hard=None):
     """写缓存条目(线程安全)。失败结果也缓存(负缓存, 短 TTL)。"""
     now = time.time()
     if is_error:
@@ -214,30 +214,48 @@ def _store_cache(key, result, ttl, is_error=False):
         entry = {"ts": now, "data": result, "is_error": True,
                  "fresh_until": fresh_until, "hard_until": fresh_until}
     else:
-        hard_until = now + max(ttl * _HARD_TTL_FACTOR, ttl + 300)
+        if hard:
+            hard_until = now + hard
+        else:
+            hard_until = now + max(ttl * _HARD_TTL_FACTOR, ttl + 300)
         entry = {"ts": now, "data": result, "is_error": False,
                  "fresh_until": now + ttl, "hard_until": hard_until}
     with _cache_lock:
         _cache[key] = entry
 
 
+def _fmt_fetched_at(ts: float) -> str:
+    """缓存条目时间戳 → 人类可读 (供 stale 标注)。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _mark_stale(data, ts):
+    """stale 命中时给返回副本注入标注(不污染缓存内原始 dict)。"""
+    if isinstance(data, dict):
+        marked = dict(data)
+        marked["stale"] = True
+        marked["fetched_at"] = _fmt_fetched_at(ts)
+        return marked
+    return data
+
+
 def _cache_status(func, args=(), kwargs=None):
-    """缓存状态检查(线程安全)。Returns (status, data), status ∈ fresh/stale/miss."""
+    """缓存状态检查(线程安全). Returns (status, data, ts), status ∈ fresh/stale/miss."""
     kwargs = kwargs or {}
     ttl = getattr(func, '_cached_ttl', 0)
     if ttl <= 0:
-        return "miss", None
+        return "miss", None, None
     key = _cache_key(func.__name__, args, kwargs)
     now = time.time()
     with _cache_lock:
         entry = _cache.get(key)
     if not entry:
-        return "miss", None
+        return "miss", None, None
     if now < entry["fresh_until"]:
-        return "fresh", entry["data"]
+        return "fresh", entry["data"], entry["ts"]
     if now < entry["hard_until"]:
-        return "stale", entry["data"]
-    return "miss", None
+        return "stale", entry["data"], entry["ts"]
+    return "miss", None, None
 
 
 def _refresh_in_background(key, func, args, kwargs, ttl):
@@ -256,11 +274,13 @@ def _refresh_in_background(key, func, args, kwargs, ttl):
                 raw = getattr(func, "__wrapped__", func)
                 result = raw(*args, **kwargs)
             ok = isinstance(result, dict) and result.get("success")
-            _store_cache(key, result, ttl, is_error=not ok)
+            _store_cache(key, result, ttl, is_error=not ok,
+                         hard=getattr(func, "_cached_hard", None))
         except Exception as e:
             _store_cache(key, {"success": False,
                                "error": f"{type(e).__name__}: {str(e)[:200]}"},
-                         ttl, is_error=True)
+                         ttl, is_error=True,
+                         hard=getattr(func, "_cached_hard", None))
         finally:
             with _cache_lock:
                 _refresh_workers.discard(key)
@@ -290,7 +310,8 @@ def _single_flight_fetch(func, args, kwargs, ttl):
             raw = getattr(func, "__wrapped__", func)
             result = raw(*args, **kwargs)
         ok = isinstance(result, dict) and result.get("success")
-        _store_cache(key, result, ttl, is_error=not ok)
+        _store_cache(key, result, ttl, is_error=not ok,
+                     hard=getattr(func, "_cached_hard", None))
         waiter["data"] = result
     except Exception as e:
         result = {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
@@ -303,19 +324,20 @@ def _single_flight_fetch(func, args, kwargs, ttl):
 
 
 def _serve_cached(func, args, kwargs):
-    """统一缓存服务入口: fresh → 直返; stale → 锁内 wrapper(启动刷新, 零等待);
+    """统一缓存服务入口: fresh → 直返; stale → 标注副本 + 后台刷新(请求零等待);
     miss → single-flight 合并并发冷调用。"""
-    status, cached_data = _cache_status(func, args, kwargs)
+    status, cached_data, ts = _cache_status(func, args, kwargs)
     if status == "fresh":
         return cached_data
     ttl = getattr(func, "_cached_ttl", 0) or CACHE_TTL
     if status == "stale":
-        with _cdp_lock:
-            return func(*args, **kwargs)
+        _refresh_in_background(
+            _cache_key(func.__name__, args, kwargs), func, args, kwargs, ttl)
+        return _mark_stale(cached_data, ts)
     return _single_flight_fetch(func, args, kwargs, ttl)
 
 
-def cached(ttl=None):
+def cached(ttl=None, hard=None):
     ttl = ttl or CACHE_TTL
     def decorator(func):
         @wraps(func)
@@ -329,15 +351,16 @@ def cached(ttl=None):
             if entry and now < entry["fresh_until"]:
                 return entry["data"]
             if entry and now < entry["hard_until"]:
-                # SWR: 返回旧数据 + 后台刷新(单飞行), 请求零等待
+                # SWR: 返回标注副本(stale/fetched_at) + 后台刷新(单飞行), 请求零等待
                 _refresh_in_background(key, func, args, kwargs, ttl)
-                return entry["data"]
+                return _mark_stale(entry["data"], entry["ts"])
             # miss/hard-expired: 当前线程执行(调用方持锁或走 single-flight)
             result = func(*args, **kwargs)
             ok = isinstance(result, dict) and result.get("success")
-            _store_cache(key, result, ttl, is_error=not ok)
+            _store_cache(key, result, ttl, is_error=not ok, hard=hard)
             return result
         wrapper._cached_ttl = ttl
+        wrapper._cached_hard = hard
         return wrapper
     return decorator
 
@@ -2314,6 +2337,128 @@ def fetch_concept_blocks_wencai(code: str):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
+# ── 15b. 个股概念板块明细（同花顺 F10 astockpc SPA #/concept）──
+# 问财通道概念数据不稳定，切换为新版 F10 概念题材页（playwright 渲染提取）。
+# marketid 复用 _infer_marketid 规则（与分红/主力持仓接口一致）。
+
+
+@cached(ttl=3600)
+def fetch_stock_concept(code: str, market: str = "", name: str = ""):
+    """
+    通过 playwright 访问同花顺新版 F10 概念题材页（astockpc SPA #/concept），提取:
+    1. 相关概念明细: 概念名称/标签(走势最相关等)/龙头股列表/概念解析
+    2. 上涨周期: 概念组合的上涨时间/区间涨幅/区间涨跌/主力资金/区间换手 + 驱动逻辑(AI解读)
+    market 未提供时按代码前缀推断（60/68→17, 90→18, 00/30→33, 20→34, 8/4→151）。
+    """
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwright 未安装"}
+
+    if not market:
+        market = str(_infer_marketid(code))
+
+    async def _do_query():
+        from urllib.parse import quote
+
+        name_q = quote(name or code)
+        url = (
+            "https://basic.10jqka.com.cn/astockpc/astockmain/index.html"
+            f"#/concept?code={code}&marketid={market}&code_name={name_q}"
+        )
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(_WENCAI_CDP)
+            try:
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await ctx.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 900})
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                # 信号等待: 相关概念明细渲染完成
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!document.querySelector('#concept_related .detail-item')"
+                    ),
+                    timeout=15.0,
+                )
+
+                concepts = await page.evaluate(
+                    """() => {
+                        const items = document.querySelectorAll('#concept_related .detail-item');
+                        const out = [];
+                        for (const it of items) {
+                            const name = (it.querySelector('.name-text')?.textContent || '').trim();
+                            const tag = (it.querySelector('.tag')?.textContent || '').trim();
+                            const stocks = Array.from(it.querySelectorAll('.leading-stocks .stock-name'))
+                                .map(s => (s.textContent || '').trim()).filter(Boolean);
+                            const analysis = (it.querySelector('.analysis-text')?.textContent || '').trim();
+                            if (name) out.push({name, tag, leading_stocks: stocks, analysis});
+                        }
+                        return out;
+                    }"""
+                )
+
+                # 上涨周期: 切换到该标签后提取概念组合周期数据
+                rise_cycles = []
+                await page.evaluate(
+                    """() => {
+                        const els = document.querySelectorAll('.sub-nav-item');
+                        for (const el of els) {
+                            if ((el.textContent || '').trim() === '上涨周期') { el.click(); return; }
+                        }
+                    }"""
+                )
+                await _wait_for_ready(
+                    page,
+                    lambda: page.evaluate(
+                        "() => !!document.querySelector('#concept_cycle .data-details')"
+                    ),
+                    timeout=10.0,
+                )
+                rise_cycles = await page.evaluate(
+                    """() => {
+                        const out = [];
+                        for (const d of document.querySelectorAll('#concept_cycle .data-details')) {
+                            const tags = Array.from(d.querySelectorAll('.concept-tags .tag'))
+                                .map(t => (t.textContent || '').trim()).filter(Boolean);
+                            const metrics = {};
+                            for (const item of d.querySelectorAll('.metric-item')) {
+                                const label = (item.querySelector('.metric-label')?.textContent || '').trim();
+                                const value = (item.querySelector('.metric-value')?.textContent || '').trim();
+                                if (label && value) metrics[label] = value;
+                            }
+                            const interpretation = (d.querySelector('.ai-content')?.textContent || '').trim();
+                            out.push({concepts: tags, metrics, interpretation});
+                        }
+                        return out;
+                    }"""
+                )
+
+                if not concepts and not rise_cycles:
+                    return {"success": False, "error": f"concept 页未提取到概念数据（{code}）"}
+                return {
+                    "success": True,
+                    "data": {
+                        "code": code,
+                        "marketid": market,
+                        "concepts": concepts,
+                        "rise_cycles": rise_cycles,
+                    },
+                    "source": "同花顺F10(astockpc)",
+                }
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    try:
+        return asyncio.run(_do_query())
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
 # ── 16. 个股资金流时序+概念（通过 playwright 拉问财 barline3）──
 @cached(ttl=600)
 def fetch_fund_flow_wencai(code: str):
@@ -3935,7 +4080,7 @@ def fetch_industry_board(top_n: int = 20):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
-@cached(ttl=180)
+@cached(ttl=180, hard=900)
 def fetch_global_news_cls(limit: int = 20):
     """财联社电报全球快讯（Playwright 爬取）。
 
@@ -4039,7 +4184,7 @@ def fetch_global_news_cls(limit: int = 20):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
-@cached(ttl=180)
+@cached(ttl=180, hard=900)
 def fetch_global_news_em(limit: int = 20):
     """东方财富 7x24 全球快讯（Playwright 爬取）。
 
@@ -4136,7 +4281,7 @@ def fetch_global_news_em(limit: int = 20):
         return {"success": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
-@cached(ttl=180)
+@cached(ttl=180, hard=900)
 def fetch_stock_news_em(limit: int = 20):
     """东财股票频道新闻汇总（Playwright 爬取 DOM）。
 
@@ -4277,7 +4422,7 @@ _BING_FRESHNESS_FILTER = {
     "month": 'ex1:"ez5_1702"',
 }
 
-@cached(ttl=180)
+@cached(ttl=180, hard=900)
 def fetch_search_bing(q: str, count: int = 20, freshness: str = ""):
     """Bing 网页搜索（www.bing.com 国内直连, 自动落到 cn.bing.com）。
 
@@ -4580,6 +4725,27 @@ def _truncate_at_sentence(text: str, limit: int) -> str:
     return cut.rstrip()
 
 @cached(ttl=300)
+def _extract_with_trafilatura(html: str) -> str:
+    """trafilatura 正文提取（无 LLM，纯算法，适配任意站点结构）。
+
+    作为站点专用选择器的兜底：选择器未命中/提取过短时调用。
+    返回提取到的正文（可能为空）。
+    """
+    try:
+        import trafilatura
+    except ImportError:
+        return ""
+    try:
+        return (trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            favor_precision=True,  # 兜底场景宁缺毋滥: 剔除导航/推荐/页脚噪音
+        ) or "").strip()
+    except Exception:
+        return ""
+
+
 def fetch_article(url: str, max_chars: int = 3000):
     """抓取网页正文: 标题/发布时间/正文(按域名选择器优先, 通用启发式兜底)。
 
@@ -4637,43 +4803,80 @@ def fetch_article(url: str, max_chars: int = 3000):
                         return (await page.evaluate("() => (document.body ? document.body.innerText.length : 0)")) == n
                     await _wait_for_ready(page, _article_text_settled, timeout=6.0, confirm_rounds=1)
 
-                    data = await page.evaluate(
-                        """(preferred) => {
+                    # 正文提取: trafilatura 主路径（结构自适应，无 LLM 依赖，
+                    # 无需为每个外站维护选择器；JS 选择器仅作最后保险）
+                    try:
+                        html = await page.content()
+                    except Exception:
+                        html = ""
+                    text = _extract_with_trafilatura(html)
+
+                    # 标题/时间: meta 标签确定性提取
+                    meta = await page.evaluate(
+                        """() => {
                         const pick = (q) => {
                             const el = document.querySelector(q);
                             return el ? el.textContent.trim() : '';
                         };
-                        const title = pick('meta[property="og:title"]')
-                            || pick('meta[name="title"]') || document.title || '';
-                        const time = pick('meta[property="article:published_time"]')
-                            || pick('meta[name="publishdate"]')
-                            || pick('meta[name="pubdate"]')
-                            || (document.querySelector('time') ? document.querySelector('time').textContent.trim() : '');
-                        const sels = [
-                            ...(preferred || []),
-                            'article', 'main', '[role="main"]',
-                            '.article-content', '.article', '.content', '.post-content',
-                            '#artibody', '.rich_media_content', '#js_content', '.ContentBody',
-                        ].filter((v, i, a) => a.indexOf(v) === i);
-                        let best = null, bestLen = 0;
-                        for (const s of sels) {
-                            const els = document.querySelectorAll(s);
-                            for (const el of els) {
-                                const t = (el.innerText || '').trim();
-                                if (t.length > bestLen) { best = t; bestLen = t.length; }
-                            }
-                        }
-                        // 兜底: 取 body 文本, 去掉脚本/样式
-                        if (!best || bestLen < 100) {
-                            const b = document.body.cloneNode(true);
-                            b.querySelectorAll('script, style, noscript, iframe, nav, header, footer, aside').forEach(n => n.remove());
-                            best = (b.innerText || '').trim();
-                        }
-                        return { title, time, text: best };
-                    }""",
-                        preferred,
+                        return {
+                            title: pick('meta[property="og:title"]')
+                                || pick('meta[name="title"]') || document.title || '',
+                            time: pick('meta[property="article:published_time"]')
+                                || pick('meta[name="publishdate"]')
+                                || pick('meta[name="pubdate"]')
+                                || (document.querySelector('time') ? document.querySelector('time').textContent.trim() : '')
+                        };
+                    }"""
                     )
-                    text = (data.get("text") or "").strip()
+                    title = (meta.get("title") or "").strip()
+                    pub_time = (meta.get("time") or "").strip()
+
+                    # trafilatura 未提取到 → 回退 JS 选择器提取（原逻辑作保险）
+                    if len(text) < 100:
+                        data = await page.evaluate(
+                            """(preferred) => {
+                            const pick = (q) => {
+                                const el = document.querySelector(q);
+                                return el ? el.textContent.trim() : '';
+                            };
+                            const title = pick('meta[property="og:title"]')
+                                || pick('meta[name="title"]') || document.title || '';
+                            const time = pick('meta[property="article:published_time"]')
+                                || pick('meta[name="publishdate"]')
+                                || pick('meta[name="pubdate"]')
+                                || (document.querySelector('time') ? document.querySelector('time').textContent.trim() : '');
+                            const sels = [
+                                ...(preferred || []),
+                                'article', 'main', '[role="main"]',
+                                '.article-content', '.article', '.content', '.post-content',
+                                '#artibody', '.rich_media_content', '#js_content', '.ContentBody',
+                            ].filter((v, i, a) => a.indexOf(v) === i);
+                            let best = null, bestLen = 0;
+                            for (const s of sels) {
+                                const els = document.querySelectorAll(s);
+                                for (const el of els) {
+                                    const t = (el.innerText || '').trim();
+                                    if (t.length > bestLen) { best = t; bestLen = t.length; }
+                                }
+                            }
+                            // 兜底: 取 body 文本, 去掉脚本/样式
+                            if (!best || bestLen < 100) {
+                                const b = document.body.cloneNode(true);
+                                b.querySelectorAll('script, style, noscript, iframe, nav, header, footer, aside').forEach(n => n.remove());
+                                best = (b.innerText || '').trim();
+                            }
+                            return { title, time, text: best };
+                        }""",
+                            preferred,
+                        )
+                        fallback_text = (data.get("text") or "").strip()
+                        if len(fallback_text) > len(text):
+                            text = fallback_text
+                        if not title:
+                            title = (data.get("title") or "").strip()
+                        if not pub_time:
+                            pub_time = (data.get("time") or "").strip()
+
                     if not text:
                         return {"success": False, "error": "未提取到正文（可能需要登录/反爬）"}
                     text = "\n".join(
@@ -4685,8 +4888,8 @@ def fetch_article(url: str, max_chars: int = 3000):
                     return {
                         "success": True,
                         "url": url,
-                        "title": (data.get("title") or "").strip(),
-                        "publish_time": (data.get("time") or "").strip(),
+                        "title": title,
+                        "publish_time": pub_time,
                         "text": text,
                         "truncated": truncated,
                         "source_domain": host,
@@ -4721,6 +4924,7 @@ ROUTES = {
     "/api/stock-kline-full":     ("个股增强K线(东财)",      fetch_stock_kline_full, ["code"]),
     "/api/financial-quarterly":  ("财务指标(同花顺F10)",    fetch_financial_quarterly, ["code"]),
     "/api/concept-blocks":       ("个股概念归属(问财)",      fetch_concept_blocks_wencai, ["code"]),
+    "/api/stock-concept":        ("概念板块明细(同花顺F10)", fetch_stock_concept, ["code"]),
     "/api/stock-levels":         ("支撑位/压力位(问财)",     fetch_stock_levels, ["code"]),
     "/api/wencai-all":           ("问财全数据(问财)",        fetch_wencai_all, ["code"]),
     "/api/eps-forecast":         ("EPS一致预期(同花顺F10)",  fetch_eps_forecast, ["code"]),
@@ -4825,27 +5029,9 @@ class DataHandler(BaseHTTPRequestHandler):
                 # 缓存快速路径 + SWR/single-flight:
                 # fresh → 直返(无锁); stale → 返回旧数据+后台刷新(零等待);
                 # miss → single-flight 合并并发冷调用(锁外等待 leader)。
-                if required_params:
-                    args = [params[p] for p in required_params]
-                    # Pass optional query params that the function accepts (e.g. start, end, days)
-                    kwargs = {}
-                    for k, v in params.items():
-                        if k not in required_params and k in func_params:
-                            ann = func_params[k].annotation
-                            if ann == int:
-                                try:
-                                    v = int(v)
-                                except (ValueError, TypeError):
-                                    pass
-                            elif ann == float:
-                                try:
-                                    v = float(v)
-                                except (ValueError, TypeError):
-                                    pass
-                            kwargs[k] = v
-                    result = _serve_cached(func, args, kwargs)
-                else:
-                    result = _serve_cached(func, (), {})
+                result = _serve_cached(func, args, kwargs)
+            else:
+                result = _serve_cached(func, (), {})
             try:
                 self._send_json(result)
             except Exception:

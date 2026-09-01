@@ -46,13 +46,13 @@ echo ----------------------------------------------------
 REM Keep alive - wait until user closes window
 pause >nul
 
-:cleanup
-echo.
-echo Stopping all services...
-taskkill /f /im chrome.exe 2>nul
-taskkill /f /fi "windowtitle eq playwright_service*" 2>nul
-taskkill /f /fi "windowtitle eq tradingagents-web*" 2>nul
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8765 " ^| findstr "LISTENING" 2^>nul') do taskkill /pid %%a /f /t 2>nul
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8501 " ^| findstr "LISTENING" 2^>nul') do taskkill /pid %%a /f /t 2>nul
-echo All stopped.
-endlocal
+@REM :cleanup
+@REM echo.
+@REM echo Stopping all services...
+@REM taskkill /f /im chrome.exe 2>nul
+@REM taskkill /f /fi "windowtitle eq playwright_service*" 2>nul
+@REM taskkill /f /fi "windowtitle eq tradingagents-web*" 2>nul
+@REM for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8765 " ^| findstr "LISTENING" 2^>nul') do taskkill /pid %%a /f /t 2>nul
+@REM for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8501 " ^| findstr "LISTENING" 2^>nul') do taskkill /pid %%a /f /t 2>nul
+@REM echo All stopped.
+@REM endlocal

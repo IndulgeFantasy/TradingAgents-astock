@@ -17,9 +17,9 @@ _PASSTHROUGH_KWARGS = (
 # 走 anthropic 通道跑第三方模型（Kimi 等）时的默认输出上限。
 # langchain-anthropic 只认识真正的 Claude 模型名，对别的模型会落到一个很小的
 # 兜底值（1.5.x 是 4096，更早的版本是 1024）——够不上一篇完整的分析报告，表现
-# 就是"报告写到一半结束"（#91）。8192 是各家 Anthropic 兼容端点普遍支持的档位；
-# 需要更长就在 config 里显式设 `max_tokens`。
-_THIRD_PARTY_DEFAULT_MAX_TOKENS = 8192
+# 就是"报告写到一半结束"（#91）。32000 与 factory 的全局默认一致，
+# 足够覆盖完整报告；需要更长就在 config 里显式设 `max_tokens`。
+_THIRD_PARTY_DEFAULT_MAX_TOKENS = 32000
 
 
 class NormalizedChatAnthropic(ChatAnthropic):

@@ -164,9 +164,9 @@ st.markdown(
 
 def _build_config() -> dict:
     config = DEFAULT_CONFIG.copy()
-    config["llm_provider"] = st.session_state.get("llm_provider", "minimax")
-    config["deep_think_llm"] = st.session_state.get("deep_think_llm", "deepseek-v4-flash")
-    config["quick_think_llm"] = st.session_state.get("quick_think_llm", "deepseek-v4-flash")
+    config["llm_provider"] = st.session_state.get("llm_provider", "opencodego")
+    config["deep_think_llm"] = st.session_state.get("deep_think_llm", "minimax-m3")
+    config["quick_think_llm"] = st.session_state.get("quick_think_llm", "minimax-m3")
     # Optional third-party / proxy endpoint. Sidebar input wins, else .env BACKEND_URL.
     backend_url = (st.session_state.get("llm_base_url") or os.getenv("BACKEND_URL") or "").strip()
     config["backend_url"] = backend_url or None

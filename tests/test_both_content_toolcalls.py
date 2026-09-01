@@ -4,6 +4,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 手动冒烟脚本（模块级直接调 LLM）。默认走 volcengine + TEST_LLM_PROVIDER，
+# 缺 API Key 时 pytest 收集会炸——没 key 就跳过，有 key 才跑。
+import pytest
+if os.getenv("TEST_LLM_PROVIDER", "volcengine") == "volcengine" and not os.getenv("VOLCENGINE_API_KEY"):
+    pytest.skip("需要 VOLCENGINE_API_KEY（或设 TEST_LLM_PROVIDER 指向已配置的 provider）", allow_module_level=True)
+
 from langchain_core.messages import HumanMessage, ToolMessage
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context, get_indicators, get_language_instruction,

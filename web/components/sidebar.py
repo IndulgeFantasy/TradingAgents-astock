@@ -174,7 +174,7 @@ def _render_llm_config() -> None:
             "深度思考模型",
             range(len(deep_options)),
             format_func=lambda i: deep_labels[i],
-            index=1,
+            index=0,
             key="deep_model_idx",
             help="用于辩论/决策等需要深度推理的任务",
         )

@@ -62,5 +62,16 @@ def setup_file_logging(
         )
         handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         root.addHandler(handler)
+    # 终端输出 (stderr): 与文件同级双输出, 便于排查。
+    # 注意: FileHandler 是 StreamHandler 的子类, 必须排除它,
+    # 且 stderr 与 rich(stdout) 分离, CLI 全屏表格不会被日志重绘打断。
+    if not any(
+        isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+        for h in root.handlers
+    ):
+        stream = logging.StreamHandler()
+        stream.setFormatter(logging.Formatter(_LOG_FORMAT))
+        root.addHandler(stream)
     root.setLevel(level)
     return log_path

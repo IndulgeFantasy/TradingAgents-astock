@@ -77,11 +77,13 @@ MODEL_OPTIONS: ProviderModeOptions = {
     },
     "opencodego": {
         "quick": [
+            ("MiniMax M3 - 512K, multimodal (via OpenCode Go)", "minimax-m3"),
             ("DeepSeek V4 Flash - via OpenCode Go", "deepseek-v4-flash"),
             ("DeepSeek V4 Pro - via OpenCode Go", "deepseek-v4-pro"),
             ("Custom model ID", "custom"),
         ],
         "deep": [
+            ("MiniMax M3 - 512K, multimodal (via OpenCode Go)", "minimax-m3"),
             ("DeepSeek V4 Pro - via OpenCode Go", "deepseek-v4-pro"),
             ("DeepSeek V4 Flash - via OpenCode Go", "deepseek-v4-flash"),
             ("Custom model ID", "custom"),

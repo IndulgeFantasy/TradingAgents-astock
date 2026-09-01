@@ -48,7 +48,7 @@ def warn_if_truncated(response, model: str):
         logger.warning(
             "模型 %s 的这次回复因为达到输出上限被截断（%s=%s），报告会缺一截。"
             "请在 config 里调大 `max_tokens`（或设环境变量 "
-            "TRADINGAGENTS_MAX_TOKENS），例如 max_tokens=16000。",
+            "TRADINGAGENTS_MAX_TOKENS），例如 max_tokens=32000。",
             model, field, value,
         )
     return response
